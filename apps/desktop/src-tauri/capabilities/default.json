@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "PoC main window. No shell, no filesystem, no custom commands.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
