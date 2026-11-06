@@ -1,0 +1,39 @@
+{
+  "product": "CLIProxyAPI",
+  "tag": "v8.0.57",
+  "version": "8.0.57",
+  "git_sha": "c2f402b45643f0740d70b9010fd7d8d0aab7ef65",
+  "repository": "https://github.com/router-for-me/CLIProxyAPI",
+  "license": "MIT",
+  "license_file": "LICENSE",
+  "license_retrieved_from": "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/v8.0.57/LICENSE",
+  "checksum_algorithm": "sha256",
+  "checksum_file": "checksums.txt",
+  "checksum_file_sha256": "2770a25337ddedaa8f76076a7804da0f494b0b66e90cef79240bca4b4424a80b",
+  "checksum_file_retrieved_from": "https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.57/checksums.txt",
+  "release_page": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.57",
+  "linux_glibc_note": "Upstream v8.0.57 release text says the default Linux archive is built against GLIBC 2.17 and supports dynamic plugins. The no-plugin archive is the musl/portable variant and is not the one this PoC runs.",
+  "evaluated_here": "CLIProxyAPI_8.0.57_linux_amd64.tar.gz",
+  "roles": {
+    "darwin_aarch64": "proposed-build-not-tested",
+    "darwin_amd64": "proposed-build-not-tested",
+    "windows_amd64": "proposed-build-not-tested",
+    "windows_aarch64": "proposed-build-not-tested",
+    "linux_amd64": "additional-evaluation",
+    "linux_aarch64": "additional-evaluation-not-run-on-this-host",
+    "linux_amd64_no_plugin": "not-selected",
+    "linux_aarch64_no_plugin": "not-selected",
+    "freebsd_amd64": "out-of-scope",
+    "freebsd_aarch64_no_plugin": "out-of-scope"
+  },
+  "source_contracts_at_git_sha": {
+    "server_routes": "internal/api/server_routes.go",
+    "health": ["GET /healthz", "HEAD /healthz"],
+    "models": "GET /v1/models",
+    "responses": "POST /v1/responses",
+    "oauth_callbacks_on_the_proxy_port": ["/codex/callback", "/antigravity/callback"],
+    "management_base": "/v8/management",
+    "local_token_store_call": "sdkAuth.NewFileTokenStore() in cmd/server/main.go when postgres, object, and git stores are not selected",
+    "login_flags": ["-codex-login", "-codex-device-login", "-antigravity-login", "-no-browser", "-oauth-callback-port", "-password", "-local-model", "-config"]
+  }
+}

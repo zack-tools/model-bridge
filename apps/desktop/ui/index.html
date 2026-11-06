@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>APP-AGG-001 PoC</title>
+    <style>
+      :root { color-scheme: light dark; font-family: "Segoe UI", "PingFang TC", "Noto Sans TC", sans-serif; }
+      body { margin: 0; background: #f4f1ea; color: #1c1915; }
+      main { max-width: 42rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+      h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+      p, li { line-height: 1.55; }
+      .tag { display: inline-block; border: 1px solid #1c1915; border-radius: 999px; padding: 0.1rem 0.55rem; font-size: 0.8rem; }
+      section { margin-top: 1.4rem; }
+      code { font-family: ui-monospace, monospace; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="tag">PHASE 1 PoC · 未發行</p>
+      <h1>本機 Codex 閘道</h1>
+      <p>這是單一操作面的薄殼。核心是釘選的 CLIProxyAPI sidecar，不是同一個 OS 行程。此頁不表示登入已完成，也不列出保證可用的模型。</p>
+      <section>
+        <h2>現況</h2>
+        <ul>
+          <li>監聽只允許 <code>127.0.0.1</code>。遠端管理關閉。</li>
+          <li>帳號登入只走上游已支援的瀏覽器 OAuth。沒有 API key 替代方案。</li>
+          <li>ChatGPT 訂閱不等於 OpenAI API 計費。</li>
+          <li>Claude 不在手動清單內。<code>/v1/models</code> 不算驗證通過。</li>
+          <li>macOS、Windows 的原生視窗尚未在此環境驗證。Linux 只是額外評估。</li>
+        </ul>
+      </section>
+      <section>
+        <h2>登入前</h2>
+        <p>請自行閱讀並遵守上游 CLIProxyAPI 與各服務商條款／公告。若出現帳號或登入警告，停止該流程。</p>
+      </section>
+    </main>
+  </body>
+</html>

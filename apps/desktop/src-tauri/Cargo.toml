@@ -1,0 +1,14 @@
+[package]
+name = "app-agg-001-desktop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "APP-AGG-001 phase 1 thin Tauri shell. Not compiled in the headless PoC run."
+
+[build-dependencies]
+tauri-build = "=2.7.4"
+
+[dependencies]
+agg-core = { path = "../../../crates/agg-core" }
+serde_json = "=1.0.133"
+tauri = "=2.12.5"

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.cache/
+/vendor/cliproxyapi/bin/
+/agent-tools/
+*.log
+.env
+auth.json
+config.toml
