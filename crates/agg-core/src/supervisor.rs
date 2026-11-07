@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
 pub struct StartRequest {
     pub program: PathBuf,
     pub work_dir: PathBuf,
@@ -35,6 +34,9 @@ pub struct Supervisor {
     redactor: Redactor,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProcessHealth { Healthy, Degraded, Exited }
+
 impl std::fmt::Debug for Supervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Supervisor")
@@ -43,8 +45,26 @@ impl std::fmt::Debug for Supervisor {
     }
 }
 
+#[derive(Debug)]
+pub struct StartFailure {
+    pub message: String,
+    /// True only when spawning failed or the spawned child was confirmed stopped.
+    pub child_absent: bool,
+}
+
+impl From<String> for StartFailure {
+    fn from(message: String) -> Self { Self { message, child_absent: true } }
+}
+impl From<&str> for StartFailure {
+    fn from(message: &str) -> Self { Self::from(message.to_string()) }
+}
+
 impl Supervisor {
     pub fn start(req: StartRequest) -> Result<Self, String> {
+        Self::start_detailed(req).map_err(|failure| failure.message)
+    }
+
+    pub fn start_detailed(req: StartRequest) -> Result<Self, StartFailure> {
         if req.gateway_key.is_empty() || req.management_password.is_empty() {
             return Err("missing local gateway key or management password".into());
         }
@@ -75,21 +95,37 @@ impl Supervisor {
             .append(true)
             .open(&stderr_path)
             .map_err(|e| e.to_string())?;
-        let mut command = Command::new(&req.program);
-        command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+        let program = fs::canonicalize(&req.program)
+            .map_err(|e| format!("resolve core executable: {e}"))?;
+        let mut command = Command::new(&program);
+        command.env_clear();
+        #[cfg(windows)]
+        {
+            let system_root = std::env::var_os("SystemRoot")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "SystemRoot is missing; cannot prepare Windows runtime".to_string())?;
+            command.env("SystemRoot", &system_root)
+                .env("PATH", PathBuf::from(&system_root).join("System32"))
+                .env("USERPROFILE", &req.work_dir)
+                .env("APPDATA", &req.work_dir)
+                .env("LOCALAPPDATA", &req.work_dir)
+                .env("TEMP", &req.work_dir)
+                .env("TMP", &req.work_dir);
+        }
+        #[cfg(not(windows))]
+        command.env("PATH", "/usr/bin:/bin")
             .env("HOME", &req.work_dir)
             .env("TMPDIR", &req.work_dir)
             .env("XDG_CONFIG_HOME", &req.work_dir)
-            .env("XDG_DATA_HOME", &req.work_dir)
-            .current_dir(&req.work_dir)
+            .env("XDG_DATA_HOME", &req.work_dir);
+        command.current_dir(&req.work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .arg("-config")
             .arg(&paths.config_path)
             .arg("-local-model");
+        #[cfg(not(windows))]
         if Path::new("/etc/ssl/certs/ca-certificates.crt").exists() {
             command.env(
                 "SSL_CERT_FILE",
@@ -115,18 +151,34 @@ impl Supervisor {
         match supervisor.wait_healthy(req.health_timeout) {
             Ok(()) => Ok(supervisor),
             Err(err) => {
-                supervisor.stop();
-                Err(err)
+                let child_absent = supervisor.stop_checked().is_ok();
+                Err(StartFailure { message: err, child_absent })
             }
         }
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let _ = self.stop_checked();
+    }
+
+    pub fn stop_checked(&mut self) -> Result<(), String> {
+        if let Some(child) = self.child.as_mut() {
+            if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_none() {
+                if let Err(err) = child.kill() {
+                    if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_none() {
+                        return Err(format!("stop core: {err}"));
+                    }
+                }
+                child.wait().map_err(|e| format!("wait for core: {e}"))?;
+            }
+            self.child.take();
         }
         self.lock.take();
+        Ok(())
     }
 
     pub fn redacted_logs(&self) -> String {
@@ -134,6 +186,17 @@ impl Supervisor {
         let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
         let combined = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
         truncate(self.redactor.redact(&combined), 2000)
+    }
+
+    pub fn health(&mut self) -> Result<ProcessHealth, String> {
+        let Some(child) = self.child.as_mut() else { return Ok(ProcessHealth::Exited) };
+        if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_some() {
+            return Ok(ProcessHealth::Exited);
+        }
+        match crate::http::exchange(self.port, "GET", "/healthz", &[], Duration::from_millis(500), &self.redactor) {
+            Ok(resp) if resp.status == 200 && resp.body.contains("ok") => Ok(ProcessHealth::Healthy),
+            _ => Ok(ProcessHealth::Degraded),
+        }
     }
 
     fn wait_healthy(&mut self, timeout: Duration) -> Result<(), String> {
@@ -218,6 +281,10 @@ pub struct ListenerReport {
 }
 
 pub fn inspect_listeners(port: u16) -> Result<ListenerReport, String> {
+    #[cfg(target_os = "macos")]
+    { return inspect_macos_listeners(port); }
+    #[cfg(not(target_os = "macos"))]
+    {
     let mut report = ListenerReport {
         loopback_v4: false,
         wildcard_v4: false,
@@ -229,8 +296,32 @@ pub fn inspect_listeners(port: u16) -> Result<ListenerReport, String> {
         inspect_proc("/proc/net/tcp6", port, true, &mut report)?;
     }
     Ok(report)
+    }
 }
 
+#[cfg(target_os = "macos")]
+fn inspect_macos_listeners(port: u16) -> Result<ListenerReport, String> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"])
+        .output().map_err(|e| format!("lsof: {e}"))?;
+    if !output.status.success() { return Err("lsof failed to inspect listeners".into()); }
+    let mut report = ListenerReport { loopback_v4: false, wildcard_v4: false, loopback_v6: false, wildcard_v6: false };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(address) = line.strip_prefix('n') else { continue };
+        let Some((host, port_text)) = address.rsplit_once(':') else { continue };
+        if port_text.parse::<u16>().ok() != Some(port) { continue; }
+        match host {
+            "127.0.0.1" => report.loopback_v4 = true,
+            "[::1]" => report.loopback_v6 = true,
+            "*" | "0.0.0.0" => report.wildcard_v4 = true,
+            "[::]" => report.wildcard_v6 = true,
+            _ => return Err(format!("unexpected listener address for port {port}")),
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn inspect_proc(path: &str, port: u16, v6: bool, report: &mut ListenerReport) -> Result<(), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     for line in text.lines().skip(1) {
@@ -278,6 +369,16 @@ mod tests {
         drop(listener);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lsof_sees_loopback_only() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let report = inspect_listeners(listener.local_addr().unwrap().port()).unwrap();
+        assert!(report.loopback_v4);
+        assert!(!report.wildcard_v4 && !report.wildcard_v6);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_proc_sees_loopback_only() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

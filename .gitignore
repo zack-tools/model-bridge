@@ -1,9 +1,27 @@
+# Build artifacts
 /target
+**/target/
+/apps/desktop/src-tauri/gen/
 **/*.rs.bk
+*.swp
+
+# Binaries and caches
 .cache/
 /vendor/cliproxyapi/bin/
 /agent-tools/
+
+# Sensitive data and local credentials
 *.log
 .env
 auth.json
 config.toml
+local_keys.json
+runtime/
+*.db
+*.pid
+
+# OS and Editor metadata
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/

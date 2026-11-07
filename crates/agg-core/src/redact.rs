@@ -15,7 +15,7 @@ const KEYS: &[&str] = &[
     "cookie",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Redactor {
     secrets: Vec<String>,
 }

@@ -1,8 +1,8 @@
 //! Canonical v8 config for the managed sidecar.
 //!
 //! The file binds 127.0.0.1, keeps remote management off, and disables the
-//! control-panel updater. The management password is not written here; the
-//! supervisor passes `-password`, which the upstream binary keeps in memory.
+//! control-panel updater. The management key is written to the private
+//! generated config because the pinned core requires it for management API access.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -110,9 +110,7 @@ fn render(
     auth_dir: &Path,
 ) -> Result<String, String> {
     let auth = auth_dir.to_str().ok_or("auth dir is not utf-8")?;
-    if auth.contains('\n') || auth.contains('"') {
-        return Err("auth dir cannot contain quotes or newlines".into());
-    }
+    let auth = serde_json::to_string(auth).map_err(|e| format!("encode auth dir: {e}"))?;
     Ok(format!(
         r#"config-version: 8
 server:
@@ -136,7 +134,7 @@ routing:
   retry:
     request-retry: 0
 oauth:
-  auth-dir: "{auth}"
+  auth-dir: {auth}
 observability:
   logs:
     request-log: false
@@ -167,8 +165,8 @@ fn quoted(prefix: &str, text: &str) -> Result<String, String> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let rest = rest.trim();
-            if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                return Ok(inner.to_string());
+            if rest.starts_with('"') && rest.ends_with('"') {
+                return serde_json::from_str(rest).map_err(|_| format!("invalid quoted {prefix}"));
             }
         }
     }
@@ -222,6 +220,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_path_is_escaped_and_round_trips() {
+        let path = Path::new(r#"C:\Users\測試 使用者\auth"#);
+        let config = render(&ListenPolicy::new("127.0.0.1", 18431).unwrap(), "localgateway012345", "management012345", path).unwrap();
+        assert!(config.contains(r#"C:\\Users\\測試 使用者\\auth"#));
+        assert_eq!(parse_managed_config(&config).unwrap().auth_dir, path.to_str().unwrap());
+    }
 
     #[test]
     fn rejects_wildcard_and_port_zero() {

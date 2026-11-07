@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 
-pub const PROVIDER_ID: &str = "app_agg_001";
+pub const PROVIDER_ID: &str = "custom";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexError {
@@ -86,18 +86,534 @@ pub fn detect_codex_home(
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApplyRequest {
     pub config_path: PathBuf,
     pub base_url: String,
     pub gateway_key: String,
     pub model: Option<String>,
+    pub allow_foreign_override: bool,
+    pub model_catalog_json: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSyncSummary {
+    pub catalog_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
+    pub total_models: usize,
+    pub added_slugs: Vec<String>,
+    pub existing_slugs: Vec<String>,
+}
+
+pub fn sync_model_catalog(
+    catalog_path: &Path,
+    verified_models: &[String],
+) -> Result<CatalogSyncSummary, CodexError> {
+    reject_symlink(catalog_path)?;
+    if file_name(catalog_path)? == "auth.json" {
+        return Err(CodexError::AuthJsonTarget);
+    }
+    let existed = catalog_path.exists();
+    let parent = catalog_path.parent().ok_or(CodexError::ParentMissing)?;
+    if !parent.is_dir() {
+        return Err(CodexError::ParentMissing);
+    }
+
+    let (mut root, backup_path) = if existed {
+        let text = fs::read_to_string(catalog_path).map_err(|e| CodexError::Message(e.to_string()))?;
+        let backup_name = format!("{}.app-agg-001.bak", file_name(catalog_path)?);
+        let bpath = parent.join(&backup_name);
+        fs::copy(catalog_path, &bpath).map_err(|e| CodexError::Message(e.to_string()))?;
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| CodexError::Message(format!("json parse: {e}")))?;
+        (json, Some(bpath))
+    } else {
+        (serde_json::json!({ "models": [] }), None)
+    };
+
+    let models_arr = root.get_mut("models")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| CodexError::Message("model_catalog.json does not contain a 'models' array".into()))?;
+
+    // 依使用者指示：移除先前加入之不支援串流工具回合的 image 模型條目
+    models_arr.retain(|entry| {
+        let slug = entry.get("slug").and_then(|s| s.as_str()).unwrap_or("");
+        let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
+        let is_agg_image = desc.starts_with("APP-AGG-001 aggregated model:") && slug.to_ascii_lowercase().contains("image");
+        !is_agg_image
+    });
+
+    let mut existing_slugs = Vec::new();
+    let mut added_slugs = Vec::new();
+
+    for model in verified_models {
+        if model.trim().is_empty() || model.to_ascii_lowercase().contains("image") { continue; }
+        let already = models_arr.iter().any(|entry| {
+            entry.get("slug").and_then(|s| s.as_str()) == Some(model.as_str())
+        });
+        if already {
+            existing_slugs.push(model.clone());
+        } else {
+            let display_name = if model.starts_with("gemini") {
+                model.replace('-', " ")
+                    .split_whitespace()
+                    .map(|w| {
+                        let mut c = w.chars();
+                        match c.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else if model.starts_with("gpt") {
+                model.to_uppercase()
+            } else {
+                model.to_string()
+            };
+            let entry = if let Some(tpl) = if model.starts_with("gemini") {
+                models_arr.iter().find(|e| e.get("slug").and_then(|s| s.as_str()).map_or(false, |s| s.starts_with("gemini")))
+            } else if model.starts_with("gpt") {
+                models_arr.iter().find(|e| e.get("slug").and_then(|s| s.as_str()).map_or(false, |s| s.starts_with("gpt")))
+            } else {
+                None
+            } {
+                let mut cloned = tpl.clone();
+                if let Some(obj) = cloned.as_object_mut() {
+                    obj.insert("slug".into(), serde_json::json!(model));
+                    obj.insert("display_name".into(), serde_json::json!(display_name));
+                    obj.insert("description".into(), serde_json::json!(format!("APP-AGG-001 aggregated model: {model}")));
+                    obj.insert("priority".into(), serde_json::json!(5));
+                    obj.insert("visibility".into(), serde_json::json!("list"));
+                    obj.insert("supported_in_api".into(), serde_json::json!(true));
+                    obj.insert("input_modalities".into(), serde_json::json!(["text", "image"]));
+                    obj.insert("supports_search_tool".into(), serde_json::json!(true));
+                    obj.insert("support_verbosity".into(), serde_json::json!(true));
+                    obj.insert("shell_type".into(), serde_json::json!("unified_exec"));
+
+                    if model.contains("image") {
+                        obj.insert("default_reasoning_level".into(), serde_json::Value::Null);
+                        obj.insert("supported_reasoning_levels".into(), serde_json::json!([]));
+                    } else if model.starts_with("gemini") {
+                        obj.insert("default_reasoning_level".into(), serde_json::json!("medium"));
+                        obj.insert("supported_reasoning_levels".into(), serde_json::json!([
+                            {"effort": "low", "description": "低思考強度：快速回應，適合日常簡短問答"},
+                            {"effort": "medium", "description": "中思考強度：平衡速度與推理深度，適合大多數任務"},
+                            {"effort": "high", "description": "高思考強度：深入推理，適合複雜問題與編程"}
+                        ]));
+                    } else {
+                        obj.insert("default_reasoning_level".into(), serde_json::json!("medium"));
+                        obj.insert("supported_reasoning_levels".into(), serde_json::json!([
+                            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                            {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+                            {"effort": "high", "description": "Greater reasoning depth for complex problems"}
+                        ]));
+                    }
+                }
+                cloned
+            } else {
+                let (def_reason, supp_reason) = if model.contains("image") {
+                    (serde_json::Value::Null, serde_json::json!([]))
+                } else if model.starts_with("gemini") {
+                    (serde_json::json!("medium"), serde_json::json!([
+                        {"effort": "low", "description": "低思考強度：快速回應，適合日常簡短問答"},
+                        {"effort": "medium", "description": "中思考強度：平衡速度與推理深度，適合大多數任務"},
+                        {"effort": "high", "description": "高思考強度：深入推理，適合複雜問題與編程"}
+                    ]))
+                } else {
+                    (serde_json::json!("medium"), serde_json::json!([
+                        {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                        {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+                        {"effort": "high", "description": "Greater reasoning depth for complex problems"}
+                    ]))
+                };
+                serde_json::json!({
+                    "slug": model,
+                    "display_name": display_name,
+                    "description": format!("APP-AGG-001 aggregated model: {model}"),
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "priority": 5,
+                    "input_modalities": ["text", "image"],
+                    "supports_search_tool": true,
+                    "support_verbosity": true,
+                    "default_reasoning_level": def_reason,
+                    "supported_reasoning_levels": supp_reason,
+                    "shell_type": "unified_exec"
+                })
+            };
+            models_arr.push(entry);
+            added_slugs.push(model.clone());
+        }
+    }
+
+    let total_models = models_arr.len();
+    let formatted = serde_json::to_string_pretty(&root).map_err(|e| CodexError::Message(e.to_string()))?;
+    atomic_write(catalog_path, formatted.as_bytes())?;
+
+    Ok(CatalogSyncSummary {
+        catalog_path: catalog_path.to_path_buf(),
+        backup_path,
+        total_models,
+        added_slugs,
+        existing_slugs,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSyncSummary {
+    pub auth_json_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
+    pub synced_to_desktop: bool,
+    pub synced_from_desktop: bool,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+    pub message: String,
+}
+
+/// 安全同步 ChatGPT Desktop (auth.json) 與本機聚合閘道 (runtime/auth/codex-*.json) 的憑證。
+///
+/// 1. 當本機閘道有最新有效之憑證時，自動同步至 ~/.codex/auth.json 並設定 auth_mode 為 "chatgpt"，
+///    使 ChatGPT Desktop UI 保持登入態。
+/// 2. 當 ChatGPT Desktop 原生更新憑證時，亦能自動導入本地 runtime/auth，達成雙向憑證一致。
+/// 3. 所有磁碟寫入皆透過 atomic_write 保證 0600 本機私有權限，絕不上傳。
+pub fn sync_chatgpt_desktop_auth(
+    runtime_auth_dir: &Path,
+    codex_home: &Path,
+) -> Result<AuthSyncSummary, CodexError> {
+    reject_symlink(codex_home)?;
+    let auth_path = codex_home.join("auth.json");
+    reject_symlink(&auth_path)?;
+
+    if !codex_home.exists() {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        let _ = builder.create(codex_home);
+    }
+
+    // 1. 掃描 runtime/auth 中的有效 Codex 憑證
+    #[derive(Debug, Clone)]
+    struct RuntimeCreds {
+        access_token: String,
+        refresh_token: String,
+        id_token: Option<String>,
+        account_id: Option<String>,
+        email: Option<String>,
+        plan_type: Option<String>,
+        last_refresh: Option<String>,
+        file_path: PathBuf,
+    }
+
+    let mut runtime_creds: Vec<RuntimeCreds> = Vec::new();
+    if runtime_auth_dir.exists() && runtime_auth_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(runtime_auth_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name.starts_with("codex-")
+                    && name.ends_with(".json")
+                    && !name.ends_with(".lock")
+                    && !name.ends_with(".bak")
+                {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let disabled = val.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let acc_tok = val.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let ref_tok = val.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if !disabled && !acc_tok.is_empty() && !ref_tok.is_empty() {
+                                runtime_creds.push(RuntimeCreds {
+                                    access_token: acc_tok,
+                                    refresh_token: ref_tok,
+                                    id_token: val.get("id_token").and_then(|v| v.as_str()).map(str::to_string),
+                                    account_id: val.get("account_id").and_then(|v| v.as_str()).map(str::to_string),
+                                    email: val.get("email").and_then(|v| v.as_str()).map(str::to_string),
+                                    plan_type: val.get("plan_type").and_then(|v| v.as_str()).map(str::to_string),
+                                    last_refresh: val.get("last_refresh").and_then(|v| v.as_str()).map(str::to_string),
+                                    file_path: path,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 依 last_refresh 由新到舊排序
+    runtime_creds.sort_by(|a, b| {
+        b.last_refresh.as_deref().unwrap_or("").cmp(a.last_refresh.as_deref().unwrap_or(""))
+    });
+    let best_runtime = runtime_creds.first().cloned();
+
+    // 2. 讀取現有 ~/.codex/auth.json
+    let (mut desktop_val, auth_existed) = if auth_path.exists() {
+        let content = fs::read_to_string(&auth_path).map_err(|e| CodexError::Message(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+        (v, true)
+    } else {
+        (serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {},
+            "last_refresh": ""
+        }), false)
+    };
+
+    let desktop_access_token = desktop_val
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let desktop_refresh_token = desktop_val
+        .get("tokens")
+        .and_then(|t| t.get("refresh_token"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let desktop_last_refresh = desktop_val
+        .get("last_refresh")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let has_valid_desktop = !desktop_access_token.is_empty() && !desktop_refresh_token.is_empty();
+
+    // 3. 雙向同步決策
+    if let Some(rt) = best_runtime {
+        let desktop_is_newer = has_valid_desktop && desktop_last_refresh.as_str() > rt.last_refresh.as_deref().unwrap_or("");
+        if desktop_is_newer {
+            // ChatGPT Desktop 擁有更新的 token -> 同步回 runtime 檔案
+            if let Ok(content) = fs::read_to_string(&rt.file_path) {
+                if let Ok(mut rt_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    rt_val["access_token"] = serde_json::json!(desktop_access_token);
+                    rt_val["refresh_token"] = serde_json::json!(desktop_refresh_token);
+                    if let Some(id_tok) = desktop_val.get("tokens").and_then(|t| t.get("id_token")).and_then(|v| v.as_str()) {
+                        rt_val["id_token"] = serde_json::json!(id_tok);
+                    }
+                    if !desktop_last_refresh.is_empty() {
+                        rt_val["last_refresh"] = serde_json::json!(desktop_last_refresh);
+                    }
+                    let out = serde_json::to_string_pretty(&rt_val).map_err(|e| CodexError::Message(e.to_string()))?;
+                    atomic_write(&rt.file_path, out.as_bytes())?;
+                }
+            }
+            return Ok(AuthSyncSummary {
+                auth_json_path: auth_path,
+                backup_path: None,
+                synced_to_desktop: false,
+                synced_from_desktop: true,
+                email: rt.email,
+                account_id: rt.account_id,
+                plan_type: rt.plan_type,
+                message: "已自 ChatGPT Desktop 導入最新登入憑證至聚合閘道".into(),
+            });
+        }
+
+        // 兩端 token 相同且有效 -> 無須覆寫
+        if has_valid_desktop && desktop_access_token == rt.access_token && desktop_refresh_token == rt.refresh_token {
+            return Ok(AuthSyncSummary {
+                auth_json_path: auth_path,
+                backup_path: None,
+                synced_to_desktop: false,
+                synced_from_desktop: false,
+                email: rt.email,
+                account_id: rt.account_id,
+                plan_type: rt.plan_type,
+                message: "ChatGPT Desktop 憑證已與本機閘道保持最新同步（登入狀態良好）".into(),
+            });
+        }
+
+        // 本機閘道有最新憑證 -> 同步至 ~/.codex/auth.json
+        let backup_path = if auth_existed {
+            let bpath = codex_home.join("auth.json.app-agg-001.bak");
+            let _ = fs::copy(&auth_path, &bpath);
+            Some(bpath)
+        } else {
+            None
+        };
+
+        desktop_val["auth_mode"] = serde_json::json!("chatgpt");
+        if desktop_val.get("OPENAI_API_KEY").is_none() {
+            desktop_val["OPENAI_API_KEY"] = serde_json::Value::Null;
+        }
+        if desktop_val.get("tokens").is_none() {
+            desktop_val["tokens"] = serde_json::json!({});
+        }
+        if let Some(obj) = desktop_val.get_mut("tokens").and_then(|v| v.as_object_mut()) {
+            obj.insert("access_token".into(), serde_json::json!(rt.access_token));
+            obj.insert("refresh_token".into(), serde_json::json!(rt.refresh_token));
+            if let Some(it) = &rt.id_token {
+                obj.insert("id_token".into(), serde_json::json!(it));
+            }
+            if let Some(aid) = &rt.account_id {
+                obj.insert("account_id".into(), serde_json::json!(aid));
+            }
+        }
+        if let Some(lr) = &rt.last_refresh {
+            desktop_val["last_refresh"] = serde_json::json!(lr);
+        }
+
+        let formatted = serde_json::to_string_pretty(&desktop_val).map_err(|e| CodexError::Message(e.to_string()))?;
+        atomic_write(&auth_path, formatted.as_bytes())?;
+
+        Ok(AuthSyncSummary {
+            auth_json_path: auth_path,
+            backup_path,
+            synced_to_desktop: true,
+            synced_from_desktop: false,
+            email: rt.email.clone(),
+            account_id: rt.account_id.clone(),
+            plan_type: rt.plan_type.clone(),
+            message: format!("已成功將本機有效憑證同步至 ChatGPT Desktop (帳號: {})", rt.email.as_deref().unwrap_or("已驗證")),
+        })
+    } else if has_valid_desktop {
+        // 本機 runtime 尚無憑證，但 ChatGPT Desktop 原生有有效 token -> 導出至 runtime
+        if !runtime_auth_dir.exists() {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            let _ = builder.create(runtime_auth_dir);
+        }
+        let acc_id = desktop_val.get("tokens")
+            .and_then(|t| t.get("account_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let id_tok = desktop_val.get("tokens")
+            .and_then(|t| t.get("id_token"))
+            .and_then(|v| v.as_str());
+
+        let (email, plan_type) = if let Some(jwt) = id_tok {
+            let payload = decode_jwt_payload(jwt);
+            let email = payload.as_ref().and_then(|p| p.get("email")).and_then(|v| v.as_str()).map(str::to_string);
+            let plan = payload.as_ref()
+                .and_then(|p| p.get("https://api.openai.com/auth"))
+                .and_then(|a| a.get("chatgpt_plan_type"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (email, plan)
+        } else {
+            (None, None)
+        };
+
+        let short_id = if acc_id.len() >= 8 { &acc_id[..8] } else { acc_id };
+        let email_slug = email.as_deref().unwrap_or("desktop-user");
+        let plan_slug = plan_type.as_deref().unwrap_or("plus");
+        let target_name = format!("codex-{short_id}-{email_slug}-{plan_slug}.json");
+        let target_path = runtime_auth_dir.join(target_name);
+
+        let runtime_entry = serde_json::json!({
+            "access_token": desktop_access_token,
+            "refresh_token": desktop_refresh_token,
+            "id_token": id_tok,
+            "account_id": acc_id,
+            "email": email,
+            "plan_type": plan_type,
+            "disabled": false,
+            "last_refresh": desktop_last_refresh,
+            "type": "codex"
+        });
+
+        let formatted = serde_json::to_string_pretty(&runtime_entry).map_err(|e| CodexError::Message(e.to_string()))?;
+        atomic_write(&target_path, formatted.as_bytes())?;
+
+        Ok(AuthSyncSummary {
+            auth_json_path: auth_path,
+            backup_path: None,
+            synced_to_desktop: false,
+            synced_from_desktop: true,
+            email,
+            account_id: Some(acc_id.to_string()),
+            plan_type,
+            message: "已自 ChatGPT Desktop 匯入登入憑證至本地聚合閘道".into(),
+        })
+    } else {
+        Ok(AuthSyncSummary {
+            auth_json_path: auth_path,
+            backup_path: None,
+            synced_to_desktop: false,
+            synced_from_desktop: false,
+            email: None,
+            account_id: None,
+            plan_type: None,
+            message: "未在閘道或 ChatGPT Desktop 中發現有效之本機登入憑證".into(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyPreview {
     pub diff: String,
     pub creates_file: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CodexConfigStatus {
+    pub config_path: PathBuf,
+    pub exists: bool,
+    pub is_symlink: bool,
+    pub managed_by_us: bool,
+    pub external_edit_detected: bool,
+    pub has_backup: bool,
+    pub current_model: Option<String>,
+}
+
+pub fn inspect_codex_config(config_path: &Path) -> Result<CodexConfigStatus, CodexError> {
+    let is_symlink = if config_path.exists() {
+        let meta = fs::symlink_metadata(config_path).map_err(|e| CodexError::Message(e.to_string()))?;
+        meta.file_type().is_symlink()
+    } else {
+        false
+    };
+    let exists = config_path.exists();
+    let ownership_file = ownership_path(config_path);
+    let ownership = read_ownership(&ownership_file)?;
+
+    let mut managed_by_us = false;
+    let mut external_edit_detected = false;
+    let mut has_backup = false;
+    let mut current_model = None;
+
+    if exists && !is_symlink {
+        if let Ok(content) = fs::read_to_string(config_path) {
+            current_model = top_level_string(&content, "model");
+            if let Some(ownership) = ownership {
+                managed_by_us = true;
+                let current_hash = crate::pin::sha256_bytes(content.as_bytes());
+                external_edit_detected = current_hash != ownership.sha256;
+                if let Some(backup_name) = &ownership.backup {
+                    if let Some(parent) = config_path.parent() {
+                        has_backup = parent.join(backup_name).exists();
+                    }
+                }
+            }
+        }
+    } else if let Some(ownership) = ownership {
+        managed_by_us = true;
+        external_edit_detected = true;
+        if let Some(backup_name) = &ownership.backup {
+            if let Some(parent) = config_path.parent() {
+                has_backup = parent.join(backup_name).exists();
+            }
+        }
+    }
+
+    Ok(CodexConfigStatus {
+        config_path: config_path.to_path_buf(),
+        exists,
+        is_symlink,
+        managed_by_us,
+        external_edit_detected,
+        has_backup,
+        current_model,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +629,7 @@ struct Ownership {
 pub fn preview_apply(req: &ApplyRequest) -> Result<ApplyPreview, CodexError> {
     validate_request(req)?;
     let before = read_existing(&req.config_path)?;
-    reject_foreign(&req.config_path, &before)?;
+    reject_foreign(&req.config_path, &before, req.allow_foreign_override)?;
     let after = mutate(&before, req)?;
     let diff = Redactor::new([req.gateway_key.clone()]).redact(&line_diff(&before, &after));
     Ok(ApplyPreview {
@@ -233,7 +749,10 @@ fn read_existing(path: &Path) -> Result<String, CodexError> {
     fs::read_to_string(path).map_err(|e| CodexError::Message(e.to_string()))
 }
 
-fn reject_foreign(path: &Path, before: &str) -> Result<(), CodexError> {
+fn reject_foreign(path: &Path, before: &str, allow_override: bool) -> Result<(), CodexError> {
+    if allow_override {
+        return Ok(());
+    }
     let ownership = read_ownership(&ownership_path(path))?;
     if let Some(ownership) = ownership {
         let current_hash = crate::pin::sha256_bytes(before.as_bytes());
@@ -278,22 +797,39 @@ fn mutate(before: &str, req: &ApplyRequest) -> Result<String, CodexError> {
     if let Some(model) = &req.model {
         doc["model"] = toml_edit::value(model.as_str());
     }
-    let providers = nested_table(doc.as_table_mut(), "model_providers");
-    let entry = nested_table(providers, PROVIDER_ID);
-    entry["name"] = toml_edit::value("APP-AGG-001");
+    if let Some(catalog) = &req.model_catalog_json {
+        if let Some(s) = catalog.to_str() {
+            doc["model_catalog_json"] = toml_edit::value(s);
+        }
+    }
+    let providers = nested_table(doc.as_table_mut(), "model_providers")?;
+    let entry = nested_table(providers, PROVIDER_ID)?;
+    entry["name"] = toml_edit::value("Custom");
     entry["base_url"] = toml_edit::value(req.base_url.as_str());
     entry["wire_api"] = toml_edit::value("responses");
-    entry["requires_openai_auth"] = toml_edit::value(false);
-    let headers = nested_table(entry, "http_headers");
+    entry["requires_openai_auth"] = toml_edit::value(true);
+    entry["experimental_bearer_token"] = toml_edit::value(req.gateway_key.as_str());
+    let headers = nested_table(entry, "http_headers")?;
     headers["X-Api-Key"] = toml_edit::value(req.gateway_key.as_str());
+
+    // 同步更新既有 app_agg_001 提供者（若存在），確保雙向相容
+    if let Some(agg) = providers.get_mut("app_agg_001").and_then(Item::as_table_mut) {
+        agg["name"] = toml_edit::value("Custom");
+        agg["base_url"] = toml_edit::value(req.base_url.as_str());
+        agg["experimental_bearer_token"] = toml_edit::value(req.gateway_key.as_str());
+        agg["wire_api"] = toml_edit::value("responses");
+        agg["requires_openai_auth"] = toml_edit::value(true);
+    }
     Ok(doc.to_string())
 }
 
-fn nested_table<'a>(table: &'a mut Table, key: &str) -> &'a mut Table {
-    if !table.get(key).map(Item::is_table).unwrap_or(false) {
+fn nested_table<'a>(table: &'a mut Table, key: &str) -> Result<&'a mut Table, CodexError> {
+    if !table.contains_key(key) {
         table.insert(key, Item::Table(Table::new()));
     }
-    table.get_mut(key).and_then(Item::as_table_mut).unwrap()
+    table.get_mut(key).and_then(Item::as_table_mut).ok_or_else(|| {
+        CodexError::Message(format!("{key} is not a table; refusing to replace existing configuration"))
+    })
 }
 
 fn line_diff(before: &str, after: &str) -> String {
@@ -379,6 +915,51 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CodexError> {
     Ok(())
 }
 
+fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
+    let parts: Vec<&str> = jwt.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let payload_b64 = parts[1];
+    let mut s = payload_b64.replace('-', "+").replace('_', "/");
+    match s.len() % 4 {
+        2 => s.push_str("=="),
+        3 => s.push_str("="),
+        _ => {}
+    }
+    let bytes = base64_decode_raw(&s).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn base64_decode_raw(input: &str) -> Result<Vec<u8>, ()> {
+    const TABLE: [i8; 256] = {
+        let mut t = [-1i8; 256];
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < chars.len() {
+            t[chars[i] as usize] = i as i8;
+            i += 1;
+        }
+        t
+    };
+    let mut buf = Vec::new();
+    let mut accum = 0u32;
+    let mut bits = 0;
+    for &b in input.as_bytes() {
+        if b == b'=' || b.is_ascii_whitespace() { continue; }
+        let val = TABLE[b as usize];
+        if val < 0 { return Err(()); }
+        accum = (accum << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buf.push((accum >> bits) as u8);
+            accum &= (1 << bits) - 1;
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +983,8 @@ mod tests {
             base_url: "http://127.0.0.1:18431/v1".into(),
             gateway_key: "localgateway012345".into(),
             model: model.map(str::to_string),
+            allow_foreign_override: false,
+            model_catalog_json: None,
         }
     }
 
@@ -424,6 +1007,7 @@ mod tests {
         assert!(text.contains("personality = \"pragmatic\""));
         assert!(text.contains("keep = true"));
         assert!(text.contains("wire_api = \"responses\""));
+        assert!(text.contains("requires_openai_auth = true"));
         assert!(text.contains("localgateway012345"));
         assert!(!text.contains("approval_policy"));
         assert!(!text.contains("claude"));
@@ -473,6 +1057,24 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_replace_existing_non_table_configuration() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        for original in [
+            "model_providers = \"user-value\"\n",
+            "[model_providers]\ncustom = \"user-value\"\n",
+            "[model_providers.custom]\nhttp_headers = \"user-value\"\n",
+        ] {
+            fs::write(&path, original).unwrap();
+            assert!(preview_apply(&req(&dir, None)).is_err());
+            assert!(apply_config(&req(&dir, None)).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(!ownership_path(&path).exists());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn detects_env_without_inventing_a_desktop_path() {
         let found = detect_codex_home(Some("/tmp/codex-home"), Some("/tmp/should-not-win"), "linux").unwrap();
         assert_eq!(found.cli_config_path, PathBuf::from("/tmp/codex-home/config.toml"));
@@ -503,6 +1105,155 @@ mod tests {
         bad.config_path = dir.join("plain.toml");
         bad.base_url = "http://0.0.0.0:8317/v1".into();
         assert_eq!(preview_apply(&bad).unwrap_err(), CodexError::BadBaseUrl);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_reports_ownership_and_external_edit() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let initial = inspect_codex_config(&path).unwrap();
+        assert!(!initial.exists);
+        assert!(!initial.managed_by_us);
+
+        fs::write(&path, "personality = \"tester\"\n").unwrap();
+        let unmanaged = inspect_codex_config(&path).unwrap();
+        assert!(unmanaged.exists);
+        assert!(!unmanaged.managed_by_us);
+
+        apply_config(&req(&dir, Some("gpt-6-astra"))).unwrap();
+        let managed = inspect_codex_config(&path).unwrap();
+        assert!(managed.exists);
+        assert!(managed.managed_by_us);
+        assert!(!managed.external_edit_detected);
+        assert!(managed.has_backup);
+        assert_eq!(managed.current_model.as_deref(), Some("gpt-6-astra"));
+
+        fs::write(&path, fs::read_to_string(&path).unwrap() + "\n# tamper").unwrap();
+        let tampered = inspect_codex_config(&path).unwrap();
+        assert!(tampered.managed_by_us);
+        assert!(tampered.external_edit_detected);
+
+        rollback_config(&path).unwrap_err(); // conflict
+        // restore
+        fs::write(&path, fs::read_to_string(&path).unwrap().replace("\n# tamper", "")).unwrap();
+        rollback_config(&path).unwrap();
+        let reverted = inspect_codex_config(&path).unwrap();
+        assert!(reverted.exists);
+        assert!(!reverted.managed_by_us);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn syncs_model_catalog_preserving_existing_and_backing_up() {
+        let dir = scratch();
+        let cat_path = dir.join("model_catalog.json");
+        let initial = serde_json::json!({
+            "models": [
+                {
+                    "slug": "custom-existing-1",
+                    "display_name": "Custom Existing",
+                    "description": "original description",
+                    "visibility": "list"
+                }
+            ]
+        });
+        fs::write(&cat_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        let models = vec![
+            "custom-existing-1".to_string(),
+            "gpt-6-astra".to_string(),
+            "gemini-3.8-flash-high".to_string(),
+            "gpt-image-1".to_string(),
+        ];
+        let summary = sync_model_catalog(&cat_path, &models).unwrap();
+        assert_eq!(summary.total_models, 3);
+        assert_eq!(summary.existing_slugs, vec!["custom-existing-1"]);
+        assert_eq!(summary.added_slugs, vec!["gpt-6-astra", "gemini-3.8-flash-high"]);
+        assert!(summary.backup_path.is_some());
+        assert!(summary.backup_path.unwrap().exists());
+
+        let content = fs::read_to_string(&cat_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let arr = parsed["models"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["slug"], "custom-existing-1");
+        assert_eq!(arr[0]["description"], "original description");
+        assert_eq!(arr[1]["slug"], "gpt-6-astra");
+        assert_eq!(arr[1]["shell_type"], "unified_exec");
+        assert_eq!(arr[1]["support_verbosity"], true);
+        assert!(arr[1]["supported_reasoning_levels"].is_array());
+        assert_eq!(arr[1]["default_reasoning_level"], "medium");
+        assert_eq!(arr[2]["slug"], "gemini-3.8-flash-high");
+        assert_eq!(arr[2]["display_name"], "Gemini 3.8 Flash High");
+        assert_eq!(arr[2]["shell_type"], "unified_exec");
+        assert!(arr[2]["supported_reasoning_levels"].is_array());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_chatgpt_desktop_auth_both_directions() {
+        let dir = scratch();
+        let runtime_auth = dir.join("runtime").join("auth");
+        let codex_home = dir.join("codex_home");
+        fs::create_dir_all(&runtime_auth).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        // 1. Initial state: Runtime has fresh OAuth token, Desktop auth.json is empty or missing
+        let rt_file = runtime_auth.join("codex-3d4a40d6-test@example.com-plus.json");
+        let rt_json = serde_json::json!({
+            "access_token": "acc_token_12345",
+            "refresh_token": "ref_token_67890",
+            "id_token": "id_token_abcde",
+            "account_id": "acc-id-9999",
+            "email": "test@example.com",
+            "plan_type": "plus",
+            "disabled": false,
+            "last_refresh": "2026-11-07T18:00:00+08:00",
+            "type": "codex"
+        });
+        fs::write(&rt_file, serde_json::to_string(&rt_json).unwrap()).unwrap();
+
+        // Perform sync -> should populate auth.json
+        let summary1 = sync_chatgpt_desktop_auth(&runtime_auth, &codex_home).unwrap();
+        assert!(summary1.synced_to_desktop);
+        assert!(!summary1.synced_from_desktop);
+        assert_eq!(summary1.email.as_deref(), Some("test@example.com"));
+
+        let auth_json_path = codex_home.join("auth.json");
+        assert!(auth_json_path.exists());
+        let desktop_content = fs::read_to_string(&auth_json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&desktop_content).unwrap();
+        assert_eq!(parsed["auth_mode"], "chatgpt");
+        assert_eq!(parsed["tokens"]["access_token"], "acc_token_12345");
+        assert_eq!(parsed["tokens"]["refresh_token"], "ref_token_67890");
+        assert_eq!(parsed["tokens"]["account_id"], "acc-id-9999");
+        assert_eq!(parsed["last_refresh"], "2026-11-07T18:00:00+08:00");
+
+        // 2. Already synced -> should be noop
+        let summary2 = sync_chatgpt_desktop_auth(&runtime_auth, &codex_home).unwrap();
+        assert!(!summary2.synced_to_desktop);
+        assert!(!summary2.synced_from_desktop);
+        assert!(summary2.message.contains("最新同步"));
+
+        // 3. Desktop has newer token (e.g. user refreshed in ChatGPT Desktop)
+        let mut updated_desktop = parsed.clone();
+        updated_desktop["tokens"]["access_token"] = serde_json::json!("acc_token_desktop_newer");
+        updated_desktop["tokens"]["refresh_token"] = serde_json::json!("ref_token_desktop_newer");
+        updated_desktop["last_refresh"] = serde_json::json!("2026-11-07T19:00:00+08:00");
+        fs::write(&auth_json_path, serde_json::to_string(&updated_desktop).unwrap()).unwrap();
+
+        let summary3 = sync_chatgpt_desktop_auth(&runtime_auth, &codex_home).unwrap();
+        assert!(summary3.synced_from_desktop);
+        assert!(!summary3.synced_to_desktop);
+
+        let rt_content_after = fs::read_to_string(&rt_file).unwrap();
+        let rt_parsed: serde_json::Value = serde_json::from_str(&rt_content_after).unwrap();
+        assert_eq!(rt_parsed["access_token"], "acc_token_desktop_newer");
+        assert_eq!(rt_parsed["refresh_token"], "ref_token_desktop_newer");
+        assert_eq!(rt_parsed["last_refresh"], "2026-11-07T19:00:00+08:00");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

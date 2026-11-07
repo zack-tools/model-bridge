@@ -1,0 +1,46 @@
+{
+  "core_version_pin": "8.0.57",
+  "core_git_sha": "c2f402b45643f0740d70b9010fd7d8d0aab7ef65",
+  "archive_sha256_ok": true,
+  "observed_binary_sha256": "eb0a918933eefd35c64eb86448d7e4d28ec677d2f1ca2826a158cc838ac09400",
+  "health_status": 200,
+  "loopback_v4": true,
+  "wildcard_listener": false,
+  "non_loopback_connect_failed": null,
+  "management_without_key_status": 401,
+  "host": "127.0.0.1",
+  "allow_remote": false,
+  "models_auth": "bearer",
+  "catalog_rejected_claude": 0,
+  "selectable_count": 0,
+  "selectable_live_verified": 0,
+  "user_present_marks": 0,
+  "core_integration_pass": "pass",
+  "protocol_pinned_core": "pass",
+  "oauth_live_pass": "unverified",
+  "native_ui_pass": "unverified",
+  "oauth": [
+    {
+      "provider": "codex",
+      "outcome": "started-and-cancelled",
+      "http_status": 200,
+      "url_host": "auth.openai.com",
+      "auth_state": "LoggedOut",
+      "live": false,
+      "user_present_marks": 0,
+      "credential_token_material": false
+    },
+    {
+      "provider": "antigravity",
+      "outcome": "started-and-cancelled",
+      "http_status": 200,
+      "url_host": "accounts.google.com",
+      "auth_state": "LoggedOut",
+      "live": false,
+      "user_present_marks": 0,
+      "credential_token_material": false
+    }
+  ],
+  "version_line": "CLIProxyAPI Version: 8.0.57, Commit: c2f402b4, BuiltAt: 2026-11-05T16:21:10Z",
+  "notes": []
+}
