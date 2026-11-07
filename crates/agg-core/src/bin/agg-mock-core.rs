@@ -49,6 +49,7 @@ fn main() {
         exit(4);
     });
     let sessions = Mutex::new(HashSet::<String>::new());
+    let mut health_responses = 0;
     for conn in listener.incoming() {
         let Ok(mut conn) = conn else { continue };
         let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
@@ -63,6 +64,10 @@ fn main() {
                 &sessions,
             );
             let _ = conn.write_all(body.as_bytes());
+            if mode == "exit-after-health" && path == "/healthz" {
+                health_responses += 1;
+                if health_responses == 1 { break; }
+            }
         }
     }
 }
@@ -111,7 +116,11 @@ fn route(
         }
         let state = format!("mock-{provider}");
         sessions.lock().expect("sessions").insert(state.clone());
-        let host = if provider == "codex" {
+        let host = if (mode == "oauth-client" || mode == "oauth-success") && provider == "codex" {
+            "auth.openai.com"
+        } else if mode == "oauth-client" || mode == "oauth-success" {
+            "accounts.google.com"
+        } else if provider == "codex" {
             "auth.example.invalid"
         } else {
             "accounts.example.invalid"
@@ -125,14 +134,34 @@ fn route(
     }
     if target == "/v8/management/oauth/status" && method == "GET" {
         let state = query(path, "state").unwrap_or_default();
-        if sessions.lock().expect("sessions").contains(&state) {
+        let guard = sessions.lock().expect("sessions");
+        if guard.contains(&format!("{state}:ok")) || mode == "oauth-success" {
+            return respond(200, "{\"status\":\"ok\"}");
+        }
+        if guard.contains(&state) {
             return respond(200, "{\"status\":\"wait\"}");
         }
         return respond(404, "{\"error\":\"unknown_state\"}");
     }
+    if (target == "/codex/callback" || target == "/antigravity/callback") && method == "GET" {
+        let state = query(path, "state").unwrap_or_default();
+        let mut guard = sessions.lock().expect("sessions");
+        if guard.contains(&state) {
+            if query(path, "error").is_some() || query(path, "error_description").is_some() {
+                guard.remove(&state);
+                return respond(200, "{\"status\":\"error_received\"}");
+            }
+            guard.insert(format!("{state}:ok"));
+            return respond(200, "{\"status\":\"ok\"}");
+        }
+        return respond(400, "{\"error\":\"invalid_state\"}");
+    }
     if target == "/v8/management/oauth/session" && method == "DELETE" {
         let state = query(path, "state").unwrap_or_default();
-        let removed = sessions.lock().expect("sessions").remove(&state);
+        let mut guard = sessions.lock().expect("sessions");
+        let removed1 = guard.remove(&state);
+        let removed2 = guard.remove(&format!("{state}:ok"));
+        let removed = removed1 || removed2;
         return respond(200, &format!("{{\"status\":\"ok\",\"cancelled\":{removed}}}"));
     }
     if target == "/v8/management/credentials" && method == "GET" {

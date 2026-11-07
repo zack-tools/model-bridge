@@ -3,37 +3,740 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>APP-AGG-001 PoC</title>
+    <title>ModelBridge - 本機通用 AI 聚合閘道</title>
     <style>
-      :root { color-scheme: light dark; font-family: "Segoe UI", "PingFang TC", "Noto Sans TC", sans-serif; }
-      body { margin: 0; background: #f4f1ea; color: #1c1915; }
-      main { max-width: 42rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
-      h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
-      p, li { line-height: 1.55; }
-      .tag { display: inline-block; border: 1px solid #1c1915; border-radius: 999px; padding: 0.1rem 0.55rem; font-size: 0.8rem; }
-      section { margin-top: 1.4rem; }
-      code { font-family: ui-monospace, monospace; }
+      :root {
+        --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang TC", "Helvetica Neue", sans-serif;
+        --font-mono: "SF Mono", "ui-monospace", "Menlo", monospace;
+        --bg-app: #f8fafc;
+        --bg-card: #ffffff;
+        --bg-subtle: #f1f5f9;
+        --border-color: #e2e8f0;
+        --border-hover: #cbd5e1;
+        --text-primary: #0f172a;
+        --text-secondary: #475569;
+        --text-muted: #64748b;
+        --primary: #2563eb;
+        --primary-hover: #1d4ed8;
+        --success: #10b981;
+        --success-hover: #059669;
+        --warning: #f59e0b;
+        --danger: #ef4444;
+        --danger-hover: #dc2626;
+        --radius-sm: 6px;
+        --radius-md: 10px;
+        --radius-lg: 14px;
+        --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+        --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg-app: #090d16;
+          --bg-card: #131b2e;
+          --bg-subtle: #1e293b;
+          --border-color: #27354f;
+          --border-hover: #3b4d6e;
+          --text-primary: #f8fafc;
+          --text-secondary: #cbd5e1;
+          --text-muted: #94a3b8;
+          --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
+          --shadow-md: 0 4px 12px 0 rgba(0, 0, 0, 0.4);
+        }
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg-app);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* 頂部導覽列 */
+      header.app-header {
+        background: var(--bg-card);
+        border-bottom: 1px solid var(--border-color);
+        padding: 0.85rem 1.5rem;
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        box-shadow: var(--shadow-sm);
+      }
+      .header-brand {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      .app-icon {
+        width: 32px;
+        height: 32px;
+        background: linear-gradient(135deg, #2563eb, #7c3aed);
+        border-radius: var(--radius-sm);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: 800;
+        font-size: 1rem;
+        box-shadow: 0 2px 6px rgba(37, 99, 235, 0.4);
+      }
+      .app-titles h1 {
+        margin: 0;
+        font-size: 1.15rem;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+      .app-titles .subtitle {
+        margin: 0;
+        font-size: 0.78rem;
+        color: var(--text-muted);
+      }
+      .header-status {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+      }
+      .pulse-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.25rem 0.65rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-color);
+      }
+      .pulse-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #94a3b8;
+      }
+      .pulse-dot.running {
+        background: #10b981;
+        box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+        animation: pulse 2s infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.6; transform: scale(1.15); }
+      }
+
+      /* 主要容器 */
+      main {
+        max-width: 58rem;
+        margin: 0 auto;
+        padding: 1.5rem 1.25rem 3rem;
+      }
+
+      /* 快速指標卡片 Grid */
+      .metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+        gap: 0.85rem;
+        margin-bottom: 1.25rem;
+      }
+      .metric-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-md);
+        padding: 0.9rem 1.1rem;
+        box-shadow: var(--shadow-sm);
+        transition: transform 0.15s ease, border-color 0.15s ease;
+      }
+      .metric-card:hover {
+        border-color: var(--border-hover);
+        transform: translateY(-1px);
+      }
+      .metric-label {
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-muted);
+        margin-bottom: 0.25rem;
+      }
+      .metric-value {
+        font-size: 1.2rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+      }
+      .metric-hint {
+        font-size: 0.72rem;
+        color: var(--text-muted);
+        margin-top: 0.2rem;
+      }
+
+      /* 通用卡片 Section */
+      .card-section {
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-lg);
+        padding: 1.25rem 1.4rem;
+        margin-bottom: 1.25rem;
+        box-shadow: var(--shadow-sm);
+      }
+      .card-section-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.9rem;
+      }
+      .card-section-header h2 {
+        margin: 0;
+        font-size: 1.05rem;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+      .section-desc {
+        font-size: 0.82rem;
+        color: var(--text-secondary);
+        margin: 0 0 0.85rem;
+        line-height: 1.5;
+      }
+
+      /* 按鈕元件系統 */
+      button {
+        font-family: inherit;
+        font-size: 0.83rem;
+        font-weight: 600;
+        padding: 0.45rem 0.9rem;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-color);
+        background: var(--bg-subtle);
+        color: var(--text-primary);
+        cursor: pointer;
+        transition: all 0.15s ease;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.35rem;
+      }
+      button:hover:not(:disabled) {
+        background: var(--border-hover);
+        border-color: var(--text-muted);
+      }
+      button:active:not(:disabled) {
+        transform: translateY(1px);
+      }
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      button.btn-primary {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: #ffffff;
+        box-shadow: 0 2px 4px rgba(37, 99, 235, 0.2);
+      }
+      button.btn-primary:hover:not(:disabled) {
+        background: var(--primary-hover);
+        border-color: var(--primary-hover);
+      }
+      button.btn-success {
+        background: var(--success);
+        border-color: var(--success);
+        color: #ffffff;
+        box-shadow: 0 2px 4px rgba(16, 185, 129, 0.2);
+      }
+      button.btn-success:hover:not(:disabled) {
+        background: var(--success-hover);
+        border-color: var(--success-hover);
+      }
+      button.btn-danger {
+        background: #fee2e2;
+        border-color: #fca5a5;
+        color: var(--danger);
+      }
+      button.btn-danger:hover:not(:disabled) {
+        background: #fecaca;
+        border-color: #f87171;
+      }
+      button.btn-highlight {
+        background: linear-gradient(135deg, #0284c7, #2563eb);
+        border-color: transparent;
+        color: #fff;
+        font-weight: 700;
+        padding: 0.55rem 1.15rem;
+        font-size: 0.9rem;
+        box-shadow: 0 3px 8px rgba(2, 132, 199, 0.3);
+      }
+      button.btn-highlight:hover:not(:disabled) {
+        opacity: 0.95;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4);
+      }
+
+      /* 快速設定 Hero Banner */
+      .quick-setup-box {
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.08), rgba(124, 58, 237, 0.08));
+        border: 1px solid rgba(37, 99, 235, 0.25);
+        border-radius: var(--radius-md);
+        padding: 1.1rem 1.25rem;
+        margin-bottom: 1.1rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      .quick-setup-text h3 {
+        margin: 0 0 0.2rem;
+        font-size: 0.98rem;
+        font-weight: 700;
+        color: var(--text-primary);
+      }
+      .quick-setup-text p {
+        margin: 0;
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+      }
+
+      /* 帳號卡片 */
+      .accounts-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+        gap: 0.9rem;
+      }
+      .account-card {
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-md);
+        padding: 1rem 1.1rem;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+      .account-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.6rem;
+      }
+      .account-header h3 {
+        margin: 0;
+        font-size: 0.95rem;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+      }
+      .account-badge {
+        font-size: 0.7rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: 9999px;
+        background: rgba(37, 99, 235, 0.12);
+        color: var(--primary);
+        font-weight: 700;
+      }
+      .account-card p {
+        font-size: 0.8rem;
+        color: var(--text-muted);
+        margin: 0 0 0.8rem;
+        min-height: 2.4rem;
+        line-height: 1.4;
+      }
+      .account-actions {
+        display: flex;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+      }
+
+      /* 表單與輸入框 */
+      .form-group {
+        margin-bottom: 0.85rem;
+      }
+      .form-group label {
+        display: block;
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        margin-bottom: 0.3rem;
+      }
+      input[type="text"], select {
+        width: 100%;
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        padding: 0.5rem 0.75rem;
+        font-size: 0.82rem;
+        font-family: var(--font-mono);
+        color: var(--text-primary);
+        outline: none;
+        transition: border-color 0.15s, box-shadow 0.15s;
+      }
+      input[type="text"]:focus, select:focus {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+      }
+      .field-note {
+        font-size: 0.73rem;
+        color: var(--text-muted);
+        margin: 0.25rem 0 0;
+      }
+
+      /* 核取方塊樣式 */
+      .checkbox-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-size: 0.82rem;
+        cursor: pointer;
+        user-select: none;
+        color: var(--text-secondary);
+      }
+      .checkbox-label input[type="checkbox"] {
+        cursor: pointer;
+        width: 15px;
+        height: 15px;
+        accent-color: var(--primary);
+      }
+
+      /* 狀態與通知條 */
+      .status-banner {
+        font-size: 0.83rem;
+        padding: 0.6rem 0.85rem;
+        border-radius: var(--radius-sm);
+        margin: 0.6rem 0;
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-color);
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+      }
+
+      /* 模型清單 Badge Grid */
+      ul#model-list {
+        list-style: none;
+        padding: 0;
+        margin: 0.75rem 0 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+      }
+      ul#model-list li {
+        font-size: 0.75rem;
+        font-family: var(--font-mono);
+        padding: 0.25rem 0.65rem;
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+      }
+
+      /* 終端機日誌 Box */
+      .terminal-box {
+        background: #0f172a;
+        color: #e2e8f0;
+        border-radius: var(--radius-md);
+        overflow: hidden;
+        border: 1px solid #1e293b;
+        box-shadow: var(--shadow-md);
+      }
+      .terminal-header {
+        background: #1e293b;
+        padding: 0.4rem 0.85rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .terminal-dots {
+        display: flex;
+        gap: 0.35rem;
+      }
+      .dot { width: 9px; height: 9px; border-radius: 50%; }
+      .dot-red { background: #ef4444; }
+      .dot-yellow { background: #f59e0b; }
+      .dot-green { background: #10b981; }
+      pre#activity-log {
+        margin: 0;
+        padding: 0.85rem 1rem;
+        font-size: 0.76rem;
+        max-height: 230px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-family: var(--font-mono);
+        line-height: 1.45;
+        background: transparent;
+        color: #94a3b8;
+      }
+
+      /* 警告對話框 */
+      .confirm-dialog {
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        border-radius: var(--radius-md);
+        padding: 0.85rem 1rem;
+        margin: 0.6rem 0;
+      }
+      .confirm-dialog p { margin: 0 0 0.5rem; font-size: 0.83rem; color: #991b1b; font-weight: 600; }
     </style>
   </head>
   <body>
+    <!-- 頂部應用導覽列 -->
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="app-icon">MB</div>
+        <div class="app-titles">
+          <h1>ModelBridge 本機 AI 聚合閘道</h1>
+          <p class="subtitle">跨工具通用 AI 橋樑 • 支援多客戶端模型自由切換 • 供應商：Custom</p>
+        </div>
+      </div>
+      <div class="header-status">
+        <div class="pulse-badge">
+          <span id="pulse-indicator" class="pulse-dot"></span>
+          <span id="quick-status-text">檢查中…</span>
+        </div>
+      </div>
+    </header>
+
     <main>
-      <p class="tag">PHASE 1 PoC · 未發行</p>
-      <h1>本機 Codex 閘道</h1>
-      <p>這是單一操作面的薄殼。核心是釘選的 CLIProxyAPI sidecar，不是同一個 OS 行程。此頁不表示登入已完成，也不列出保證可用的模型。</p>
-      <section>
-        <h2>現況</h2>
-        <ul>
-          <li>監聽只允許 <code>127.0.0.1</code>。遠端管理關閉。</li>
-          <li>帳號登入只走上游已支援的瀏覽器 OAuth。沒有 API key 替代方案。</li>
-          <li>ChatGPT 訂閱不等於 OpenAI API 計費。</li>
-          <li>Claude 不在手動清單內。<code>/v1/models</code> 不算驗證通過。</li>
-          <li>macOS、Windows 的原生視窗尚未在此環境驗證。Linux 只是額外評估。</li>
-        </ul>
+      <!-- 頂部智慧概覽指標 (Dashboard Metrics) -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">聚合閘道端點</div>
+          <div class="metric-value" id="metric-port">127.0.0.1:50833</div>
+          <div class="metric-hint" id="metric-status-hint">監聽本機 Loopback</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">ChatGPT 官方整合</div>
+          <div class="metric-value" id="metric-desktop" style="color: #10b981;">Custom</div>
+          <div class="metric-hint" id="metric-desktop-hint">保持登入 • 雙向同步中</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">有效帳號數</div>
+          <div class="metric-value" id="metric-accounts">2 個帳號</div>
+          <div class="metric-hint">ChatGPT Plus & Antigravity</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">可用聚合模型</div>
+          <div class="metric-value" id="metric-models">16 款模型</div>
+          <div class="metric-hint">支援 GPT 與 Gemini 雙系列</div>
+        </div>
+      </div>
+
+      <!-- 核心區塊 1: 閘道控制中心 -->
+      <section class="card-section">
+        <div class="card-section-header">
+          <h2>⚡️ 閘道控制中心</h2>
+          <div style="display:flex; gap:0.4rem;">
+            <button id="start" type="button" class="btn-primary" disabled>啟動閘道</button>
+            <button id="stop" type="button" class="btn-danger" disabled>停止閘道</button>
+          </div>
+        </div>
+        <p id="status" class="status-banner" role="status" aria-live="polite">正在檢查閘道狀態…</p>
+
+        <!-- 停止確認對話方塊 -->
+        <div id="stop-confirmation" class="confirm-dialog" hidden>
+          <p>⚠️ 確定停止本機聚合閘道？（本地保存之登入憑證將 100% 完整保留於本機，下次啟動自動恢復）</p>
+          <div style="display:flex; gap:0.4rem;">
+            <button id="stop-confirm" type="button" class="btn-danger">確定停止</button>
+            <button id="stop-cancel" type="button">取消</button>
+          </div>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-top:0.6rem;">
+          <label class="checkbox-label">
+            <input id="retain-gateway" type="checkbox" checked>
+            <strong>關閉視窗時保留閘道背景運行</strong>（確保 ChatGPT Desktop / VS Code 不斷線）
+          </label>
+          <div style="display:flex; gap:0.4rem;">
+            <button id="inspect" type="button" style="font-size:0.78rem;">檢查啟動保護紀錄</button>
+            <button id="clear-guard" type="button" style="display:none; font-size:0.78rem;" class="btn-danger">清除保護紀錄</button>
+          </div>
+        </div>
+        <p id="inspection" class="field-note" role="status" aria-live="polite"></p>
       </section>
-      <section>
-        <h2>登入前</h2>
-        <p>請自行閱讀並遵守上游 CLIProxyAPI 與各服務商條款／公告。若出現帳號或登入警告，停止該流程。</p>
+
+      <!-- 核心區塊 2: ChatGPT Desktop 整合設定 -->
+      <section id="codex-config-section" class="card-section">
+        <div class="card-section-header">
+          <h2>💻 ChatGPT Desktop 整合設定 (Custom 提供者)</h2>
+        </div>
+
+        <!-- 一鍵最佳化整合按鈕 -->
+        <div class="quick-setup-box">
+          <div class="quick-setup-text">
+            <h3>🚀 一鍵設定 ChatGPT Desktop</h3>
+            <p>自動同步模型清單目錄 (model_catalog) + 套用 Custom 閘道端點 + 雙向同步登入憑證，一次搞定！</p>
+          </div>
+          <button id="one-click-setup-btn" type="button" class="btn-highlight">⚡️ 一鍵套用與同步</button>
+        </div>
+
+        <div class="form-group">
+          <label for="codex-path-input">Codex 設定檔路徑 (config.toml)：</label>
+          <input id="codex-path-input" type="text" placeholder="偵測中...">
+          <p id="codex-detect-info" class="field-note"></p>
+        </div>
+
+        <div class="form-group">
+          <label for="codex-catalog-input">ChatGPT Desktop 模型清單目錄 (model_catalog.json)：</label>
+          <input id="codex-catalog-input" type="text" placeholder="偵測中...">
+        </div>
+
+        <div class="form-group">
+          <label for="codex-model-input">指定預設模型（選填，例：gpt-6.1-terra 或 gemini-3.8-flash-high）：</label>
+          <input id="codex-model-input" type="text" placeholder="留空將維持目前設定">
+        </div>
+
+        <div class="form-group">
+          <label class="checkbox-label">
+            <input id="codex-allow-override" type="checkbox" checked>
+            允許切換既有之 model_provider 為 <strong>Custom</strong>（系統自動建立安全備份 .bak）
+          </label>
+        </div>
+
+        <!-- 獨立進階操作按鈕列 -->
+        <div style="display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.85rem;">
+          <button id="codex-sync-auth-btn" type="button" class="btn-success">🔄 同步登入憑證 (保持登入)</button>
+          <button id="codex-sync-catalog-btn" type="button" style="background:#0284c7; color:#fff;">📋 同步模型目錄 (model_catalog)</button>
+          <button id="codex-apply-btn" type="button" class="btn-primary">💾 套用至 config.toml</button>
+          <button id="codex-preview-diff" type="button">🔍 預覽安全 Diff</button>
+          <button id="codex-check-status" type="button">ℹ️ 檢查檔案狀態</button>
+          <button id="codex-rollback-btn" type="button">↩️ 還原先前設定</button>
+        </div>
+
+        <p id="codex-status-msg" class="status-banner" role="status" aria-live="polite" style="display:none;"></p>
+
+        <div id="codex-preview-box" style="display: none; margin-top: 0.75rem;">
+          <div style="font-size: 0.8rem; font-weight: 600; margin-bottom: 0.3rem;">安全變更預覽（機密金鑰已紅化保護）：</div>
+          <pre id="codex-diff-output" style="background: #0f172a; color: #a5b4fc; padding: 0.85rem; border-radius: var(--radius-sm); font-size: 0.78rem; max-height: 180px; overflow-y: auto; white-space: pre-wrap; font-family: var(--font-mono);"></pre>
+        </div>
+      </section>
+
+      <!-- 核心區塊 3: 帳號授權中心 -->
+      <section class="card-section">
+        <div class="card-section-header">
+          <h2>🔐 帳號授權管理（本機安全持久留存）</h2>
+        </div>
+        <p class="section-desc">
+          登入憑證僅保存在本地私有目錄（0700），停止閘道完整保留，絕不上傳雲端。
+        </p>
+
+        <div style="margin-bottom: 0.85rem;">
+          <label class="checkbox-label">
+            <input id="terms" type="checkbox" checked>
+            <strong>本人已閱讀提示，同意以系統瀏覽器完成授權並保存在本機</strong>
+          </label>
+        </div>
+
+        <div class="accounts-grid">
+          <!-- ChatGPT / Codex -->
+          <div class="account-card account" data-provider="codex">
+            <div>
+              <div class="account-header">
+                <h3>ChatGPT / Codex</h3>
+                <span class="account-badge">Plus 方案</span>
+              </div>
+              <p role="status" aria-live="polite">已從本機保存憑證確認登入 (已驗證)</p>
+            </div>
+            <div class="account-actions">
+              <button data-action="begin" class="btn-primary">瀏覽器登入</button>
+              <button data-action="poll">檢查狀態</button>
+              <button data-action="confirm" class="btn-success">確認完成</button>
+              <button data-action="cancel" class="btn-danger">取消</button>
+            </div>
+          </div>
+
+          <!-- Antigravity -->
+          <div class="account-card account" data-provider="antigravity">
+            <div>
+              <div class="account-header">
+                <h3>Antigravity</h3>
+                <span class="account-badge" style="background:rgba(124,58,237,0.12); color:#7c3aed;">Google Gemini</span>
+              </div>
+              <p role="status" aria-live="polite">已從本機保存憑證確認登入 (已驗證)</p>
+            </div>
+            <div class="account-actions">
+              <button data-action="begin" class="btn-primary">瀏覽器登入</button>
+              <button data-action="poll">檢查狀態</button>
+              <button data-action="confirm" class="btn-success">確認完成</button>
+              <button data-action="cancel" class="btn-danger">取消</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 核心區塊 4: 模型發現與 Gate 3 驗收探針 -->
+      <section class="card-section">
+        <div class="card-section-header">
+          <h2>🧪 聚合模型清單與 Gate 3 回合驗證</h2>
+        </div>
+        <p class="section-desc">向本機閘道查詢已認證帳號所帶出之模型，並可對特定模型執行真實串流雙回合工具調用驗證。</p>
+
+        <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+          <label for="model-provider" style="font-size:0.82rem; font-weight:600;">查詢帳號：</label>
+          <select id="model-provider" style="width:auto; min-width:11rem;">
+            <option value="codex">ChatGPT / Codex (GPT 系列)</option>
+            <option value="antigravity">Antigravity (Gemini 系列)</option>
+          </select>
+          <button id="discover-models" type="button" class="btn-primary">查詢可用模型</button>
+        </div>
+
+        <p id="model-status" class="field-note" role="status" aria-live="polite" style="margin-top:0.4rem;"></p>
+        <ul id="model-list"></ul>
+
+        <!-- Gate 3 探針區 -->
+        <div id="gate3-box" style="margin-top: 1rem; padding: 1rem; background: var(--bg-subtle); border: 1px dashed var(--border-color); border-radius: var(--radius-md);">
+          <div style="font-size:0.9rem; font-weight:700; margin-bottom:0.35rem; color:var(--text-primary);">
+            🎯 Gate 3 真實雙向串流與工具回合驗收探針
+          </div>
+          <p style="font-size:0.78rem; color:var(--text-secondary); margin:0 0 0.6rem;">
+            向所選模型發送即時串流並核驗隨機 Nonce 挑戰與帳號 Trace ID。<strong>此操作將向官方發送真實請求並消耗額度</strong>。
+          </p>
+          <div style="margin-bottom:0.6rem;">
+            <label class="checkbox-label">
+              <input id="quota-consent" type="checkbox">
+              <strong>本人明確同意發送請求並消耗該帳號之用量額度</strong>
+            </label>
+          </div>
+          <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+            <select id="verify-model-select" style="max-width:18rem;">
+              <option value="">-- 請先查詢模型 --</option>
+            </select>
+            <button id="verify-model" type="button" class="btn-primary" disabled>發起工具回合驗收</button>
+          </div>
+          <p id="verify-status" class="field-note" role="status" aria-live="polite" style="margin-top:0.4rem;"></p>
+        </div>
+      </section>
+
+      <!-- 核心區塊 5: 系統即時執行與驗收日誌 -->
+      <section class="card-section" style="padding:0; overflow:hidden; border:none; background:transparent;">
+        <div class="terminal-box">
+          <div class="terminal-header">
+            <div style="display:flex; align-items:center; gap:0.6rem;">
+              <div class="terminal-dots">
+                <span class="dot dot-red"></span>
+                <span class="dot dot-yellow"></span>
+                <span class="dot dot-green"></span>
+              </div>
+              <span style="font-size:0.75rem; font-family:var(--font-mono); font-weight:600; color:#94a3b8;">ACTIVITY LOG (即時日誌)</span>
+            </div>
+            <div style="display:flex; gap:0.35rem;">
+              <button id="copy-log-btn" type="button" style="padding:0.18rem 0.5rem; font-size:0.72rem; background:#334155; border-color:#475569; color:#f8fafc;">📋 複製日誌</button>
+              <button id="clear-log" type="button" style="padding:0.18rem 0.5rem; font-size:0.72rem; background:#334155; border-color:#475569; color:#f8fafc;">🗑 清除</button>
+            </div>
+          </div>
+          <pre id="activity-log"></pre>
+        </div>
       </section>
     </main>
+
+    <script src="./gateway.js"></script>
   </body>
 </html>

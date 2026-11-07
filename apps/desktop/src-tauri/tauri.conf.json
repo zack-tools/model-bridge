@@ -1,17 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "APP-AGG-001",
+  "productName": "ModelBridge",
   "version": "0.1.0",
-  "identifier": "local.appagg001.poc",
+  "identifier": "io.github.zacktools.modelbridge",
   "build": {
-    "frontendDist": "../ui",
-    "devUrl": "http://127.0.0.1:18431"
+    "frontendDist": "../ui"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
-        "title": "APP-AGG-001 PoC",
+        "title": "ModelBridge - Universal Local AI Gateway",
         "width": 960,
         "height": 720,
         "resizable": true

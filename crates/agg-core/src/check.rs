@@ -6,7 +6,7 @@
 
 use crate::http::exchange;
 use crate::oauth::{AccountSession, AuthState, FailureClass, PollOutcome, Provider, StartOutcome};
-use crate::pin::{self, sha256_file};
+use crate::pin;
 use crate::redact::Redactor;
 use crate::registry::{is_claude, CatalogModel, ModelRegistry, ModelStatus};
 use crate::supervisor::{inspect_listeners, Supervisor, StartRequest};
@@ -56,10 +56,8 @@ pub struct CoreCheckReport {
 }
 
 pub fn run_pinned_core_check(archive: &Path, binary: &Path) -> Result<CoreCheckReport, String> {
-    let archive_sha = pin::verify_archive(archive, pin::LINUX_AMD64_ARCHIVE)?;
-    let _ = archive_sha;
-    let observed_binary_sha256 = sha256_file(binary)?;
-    let home_marker = Path::new(&std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into()))
+    let observed_binary_sha256 = pin::verify_native_binary(archive, binary)?;
+    let home_marker = Path::new(&std::env::var("HOME").map_err(|_| "HOME is not set")?)
         .join(".cli-proxy-api");
     let home_existed = home_marker.exists();
 

@@ -27,6 +27,7 @@ impl Provider {
 pub enum AuthState {
     LoggedOut,
     Authorizing,
+    AwaitingConfirmation,
     Authenticated,
     Expired,
     Error,
@@ -42,9 +43,10 @@ pub enum FailureClass {
     Cancelled,
     RefusedUnwitnessedSuccess,
     FlowStopped,
+    PortConflict,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     Started { upstream_state: String, url_host: String },
     Failed(FailureClass),
@@ -58,7 +60,7 @@ pub enum PollOutcome {
     Failed(FailureClass),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AccountSession {
     pub provider: Provider,
     pub state: AuthState,
@@ -96,6 +98,9 @@ impl AccountSession {
     }
 
     pub fn begin(&mut self, outcome: StartOutcome) -> Result<(), FailureClass> {
+        if self.state != AuthState::LoggedOut && self.state != AuthState::Error {
+            return Err(FailureClass::FlowStopped);
+        }
         if self.state == AuthState::Error && !self.failure_surfaced {
             self.failure = Some(FailureClass::FlowStopped);
             return Err(FailureClass::FlowStopped);
@@ -188,13 +193,24 @@ impl AccountSession {
     }
 
     pub fn mark_user_present_authenticated(&mut self) -> Result<(), FailureClass> {
-        if self.state != AuthState::Authorizing {
+        if self.state != AuthState::AwaitingConfirmation {
             return Err(FailureClass::FlowStopped);
         }
         self.state = AuthState::Authenticated;
         self.live = true;
         self.user_present_marks += 1;
         self.failure = None;
+        Ok(())
+    }
+
+    /// Only the transport may record a successful upstream status. This is not
+    /// a verified live login until the user explicitly confirms their presence.
+    pub(crate) fn observe_success_for_confirmation(&mut self) -> Result<(), FailureClass> {
+        if self.state != AuthState::Authorizing {
+            return Err(FailureClass::FlowStopped);
+        }
+        self.state = AuthState::AwaitingConfirmation;
+        self.live = false;
         Ok(())
     }
 
@@ -267,5 +283,19 @@ mod tests {
         assert!(!session.live);
         session.cancel();
         assert_eq!(session.state, AuthState::LoggedOut);
+    }
+
+    #[test]
+    fn confirmation_requires_observed_upstream_success() {
+        let mut session = AccountSession::new(Provider::ChatGptCodex);
+        session.acknowledge_terms();
+        session.begin(StartOutcome::Started { upstream_state: "s".into(), url_host: "auth.openai.com".into() }).unwrap();
+        assert_eq!(session.mark_user_present_authenticated(), Err(FailureClass::FlowStopped));
+        session.observe_success_for_confirmation().unwrap();
+        assert!(!session.live);
+        assert_eq!(session.state, AuthState::AwaitingConfirmation);
+        session.mark_user_present_authenticated().unwrap();
+        assert!(session.live);
+        assert_eq!(session.user_present_marks, 1);
     }
 }

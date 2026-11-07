@@ -74,7 +74,7 @@ impl ModelRegistry {
         let mut rejected_ids = Vec::new();
         let mut unclassified = 0;
         for model in models {
-            if is_claude(&model.id, model.owned_by.as_deref()) {
+            if is_claude(&model.id, model.owned_by.as_deref()) || is_image_model(&model.id) {
                 rejected_ids.push(model.id.clone());
             } else {
                 unclassified += 1;
@@ -96,11 +96,15 @@ impl ModelRegistry {
         account_ref: &str,
         source: SourceKind,
     ) -> Result<(), String> {
-        if is_claude(model_id, None) {
-            return Err("claude is outside the manual list".into());
+        if is_claude(model_id, None) || is_image_model(model_id) || alias.is_some_and(|value| is_claude(value, None) || is_image_model(value)) {
+            return Err("claude and image models are outside the manual list".into());
         }
-        if model_id.is_empty() || account_ref.is_empty() {
+        if model_id.trim().is_empty() || account_ref.trim().is_empty() || alias.is_some_and(|v| v.trim().is_empty()) {
             return Err("model id and account ref are required".into());
+        }
+        if alias.is_some_and(|a| self.entries.iter().any(|e| e.alias.as_deref() == Some(a) || e.model_id == a))
+            || self.entries.iter().any(|e| e.alias.as_deref() == Some(model_id)) {
+            return Err("model id or alias conflicts with an existing alias".into());
         }
         self.entries.push(ModelEntry {
             model_id: model_id.to_string(),
@@ -132,7 +136,7 @@ impl ModelRegistry {
         };
         let mut added = 0;
         for id in model_ids {
-            if is_claude(id, None) {
+            if is_claude(id, None) || is_image_model(id) {
                 continue;
             }
             self.insert_explicit(None, id, account_ref, source)?;
@@ -156,18 +160,14 @@ impl ModelRegistry {
                 self.set_verified(model_id, "mock-fixture", false)
             }
             VerifyEvidence::UserPresentTurn => {
-                self.user_present_verifications += 1;
-                self.set_verified(model_id, "user-present-turn", true)
+                Err("live model verification requires an actual validated coding or tool turn".into())
             }
         }
     }
 
     pub fn note_unavailable(&mut self, model_id: &str, class: &str) -> Result<(), String> {
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|e| e.model_id == model_id)
-            .ok_or_else(|| format!("unknown model {model_id}"))?;
+        let index = self.unique_index(model_id)?;
+        let entry = &mut self.entries[index];
         entry.status = ModelStatus::Unavailable {
             observed_at: "unspecified".into(),
             validation_source: "explicit-status".into(),
@@ -177,32 +177,37 @@ impl ModelRegistry {
     }
 
     pub fn resolve(&self, name: &str) -> Result<&ModelEntry, String> {
-        self.entries
-            .iter()
-            .find(|e| e.model_id == name || e.alias.as_deref() == Some(name))
-            .ok_or_else(|| format!("no exact model or alias {name}; fallback is disabled"))
+        self.unique_index(name).map(|index| &self.entries[index])
     }
 
     pub fn selectable(&self) -> Vec<&ModelEntry> {
-        self.entries.iter().collect()
+        self.entries.iter().filter(|e| matches!(e.status, ModelStatus::Verified { live: true, .. })).collect()
     }
+
+    pub fn entries(&self) -> &[ModelEntry] { &self.entries }
 
     pub fn export_json(&self) -> serde_json::Value {
         serde_json::to_value(&self.entries).unwrap_or(serde_json::Value::Null)
     }
 
     fn set_verified(&mut self, model_id: &str, source: &str, live: bool) -> Result<(), String> {
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|e| e.model_id == model_id)
-            .ok_or_else(|| format!("unknown model {model_id}"))?;
+        let index = self.unique_index(model_id)?;
+        let entry = &mut self.entries[index];
         entry.status = ModelStatus::Verified {
             verified_at: "unspecified".into(),
             validation_source: source.into(),
             live,
         };
         Ok(())
+    }
+
+    fn unique_index(&self, name: &str) -> Result<usize, String> {
+        let mut matches = self.entries.iter().enumerate()
+            .filter(|(_, e)| e.model_id == name || e.alias.as_deref() == Some(name));
+        let index = matches.next().map(|(i, _)| i)
+            .ok_or_else(|| "no exact model or alias; fallback is disabled".to_string())?;
+        if matches.next().is_some() { return Err("model reference is ambiguous; select an account-specific alias".into()); }
+        Ok(index)
     }
 }
 
@@ -218,12 +223,12 @@ pub fn is_claude(id: &str, owned_by: Option<&str>) -> bool {
     id.contains("claude") || owned.contains("anthropic") || owned == "claude"
 }
 
+pub fn is_image_model(id: &str) -> bool {
+    id.to_ascii_lowercase().contains("image")
+}
+
 fn public_account(account_ref: &str) -> String {
-    if account_ref.contains('@') || account_ref.to_ascii_lowercase().contains("token") {
-        format!("sha256:{}", &sha256_bytes(account_ref.as_bytes())[..12])
-    } else {
-        account_ref.to_string()
-    }
+    format!("sha256:{}", &sha256_bytes(account_ref.as_bytes())[..12])
 }
 
 #[cfg(test)]
@@ -284,16 +289,35 @@ mod tests {
             .ingest_credential_models(
                 "antigravity",
                 "person@example.com",
-                &["gemini-example".into(), "claude-hidden".into()],
+                &["gemini-example".into(), "claude-hidden".into(), "gpt-image-hidden".into()],
             )
             .unwrap();
         assert_eq!(added, 1);
         let exported = registry.export_json().to_string();
         assert!(!exported.contains("person@example.com"));
         assert!(!exported.contains("claude-hidden"));
+        assert!(!exported.contains("gpt-image-hidden"));
         assert_eq!(
-            registry.selectable()[0].source,
+            registry.entries()[0].source,
             SourceKind::Antigravity
         );
+    }
+
+    #[test]
+    fn manual_selection_rejects_unverified_and_ambiguous_models() {
+        let mut registry = ModelRegistry::new();
+        registry.insert_explicit(Some("first"), "shared-model", "account-one", SourceKind::ChatGptCodex).unwrap();
+        registry.insert_explicit(Some("second"), "shared-model", "account-two", SourceKind::Antigravity).unwrap();
+        assert!(registry.resolve("shared-model").is_err());
+        assert!(registry.note_unavailable("shared-model", "error").is_err());
+        assert!(registry.note_verified("first", VerifyEvidence::UserPresentTurn).is_err());
+        assert_eq!(registry.user_present_verifications, 0);
+        registry.note_verified("first", VerifyEvidence::MockFixture).unwrap();
+        assert!(registry.selectable().is_empty(), "mock verification must not enable live selection");
+        assert!(registry.insert_explicit(Some("claude-alias"), "gpt", "acct", SourceKind::ChatGptCodex).is_err());
+        assert!(registry.insert_explicit(Some("first"), "other", "acct", SourceKind::ChatGptCodex).is_err());
+        let exported = registry.export_json().to_string();
+        assert!(!exported.contains("account-one"));
+        assert!(!exported.contains("account-two"));
     }
 }
