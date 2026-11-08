@@ -161,6 +161,12 @@ impl Supervisor {
         self.child.as_ref().map(|c| c.id())
     }
 
+    /// Leave the child running when the owning application exits.
+    pub fn detach(&mut self) {
+        self.child.take();
+        self.lock.take();
+    }
+
     pub fn stop(&mut self) {
         let _ = self.stop_checked();
     }

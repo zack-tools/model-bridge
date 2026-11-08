@@ -14,6 +14,13 @@ const metricDesktopHint = document.getElementById('metric-desktop-hint');
 const metricAccounts = document.getElementById('metric-accounts');
 const metricModels = document.getElementById('metric-models');
 
+function showStoppedIndicators() {
+  if (pulseIndicator) pulseIndicator.className = 'pulse-dot';
+  if (quickStatusText) quickStatusText.textContent = '🔴 已停止';
+  if (metricPort) metricPort.textContent = '未監聽';
+  if (metricStatusHint) metricStatusHint.textContent = '閘道未運行 (憑證安全留存)';
+}
+
 async function appendLog(level, message, details = "") {
   const ts = new Date().toLocaleTimeString();
   const logBox = document.getElementById('activity-log');
@@ -101,9 +108,7 @@ async function monitor(current, startError = null) {
     if (clearGuardBtn) clearGuardBtn.style.display = 'none';
     if (result.state === 'exited' || result.state === 'stopped') {
       status.textContent = result.state === 'exited' ? '閘道意外停止，請重新啟動' : (startError ? `啟動失敗：${startError}` : '閘道已停止 (本機登入憑證已安全保留)');
-      if (pulseIndicator) pulseIndicator.className = 'pulse-dot';
-      if (quickStatusText) quickStatusText.textContent = '🔴 已停止';
-      if (metricStatusHint) metricStatusHint.textContent = '閘道未運行 (憑證安全留存)';
+      showStoppedIndicators();
       stop.disabled = true;
       start.disabled = false;
       resetAccounts();
@@ -138,6 +143,16 @@ start.addEventListener('click', async () => {
     const port = await window.__TAURI__.core.invoke('start_gateway');
     status.textContent = `閘道健康運作中：127.0.0.1:${port}`;
     appendLog('SUCCESS', `閘道啟動成功，監聽 127.0.0.1:${port}`);
+    try {
+      const customPath = document.getElementById('codex-path-input').value.trim() || null;
+      if (await window.__TAURI__.core.invoke('codex_resume', { customPath })) {
+        appendLog('SUCCESS', '已恢復 ModelBridge 供應商與模型設定');
+      }
+    } catch (error) {
+      appendLog('ERROR', '閘道已啟動，但無法恢復供應商設定', error);
+      const info = document.getElementById('inspection');
+      if (info) info.textContent = `閘道已啟動，但無法恢復供應商設定：${error}`;
+    }
     for (const account of document.querySelectorAll('.account')) {
       const provider = account.dataset.provider;
       try {
@@ -168,7 +183,17 @@ document.getElementById('stop-confirm').addEventListener('click', async () => {
   appendLog('INFO', '正在停止閘道程序…');
   try {
     await window.__TAURI__.core.invoke('stop_gateway');
-    status.textContent = '閘道已停止 (本機登入憑證已安全保留)';
+    showStoppedIndicators();
+    let switchMessage = '';
+    try {
+      const customPath = document.getElementById('codex-path-input').value.trim() || null;
+      const changed = await window.__TAURI__.core.invoke('codex_suspend', { customPath });
+      switchMessage = changed ? '；已切回原生供應商與預設模型清單' : '；未發現由 ModelBridge 管理的設定';
+    } catch (error) {
+      switchMessage = `；無法自動切回原生設定：${error}`;
+      appendLog('ERROR', '閘道已停止，但設定切換失敗', error);
+    }
+    status.textContent = `閘道已停止 (本機登入憑證已安全保留)${switchMessage}`;
     appendLog('SUCCESS', '閘道已成功停止，本地登入憑證完整保留在 runtime/auth/');
     resetAccounts();
     start.disabled = false;
@@ -239,7 +264,25 @@ for (const account of document.querySelectorAll('.account')) {
   }
 }
 
-monitor(generation);
+async function initializeGateway() {
+  try {
+    if (await window.__TAURI__.core.invoke('auto_start_enabled')) {
+      const result = await window.__TAURI__.core.invoke('gateway_status');
+      if (result.state === 'needs_recovery') {
+        await window.__TAURI__.core.invoke('clear_run_guard');
+      }
+      if (result.state === 'stopped' || result.state === 'needs_recovery') {
+        start.disabled = false;
+        start.click();
+        return;
+      }
+    }
+  } catch (error) {
+    appendLog('ERROR', '自動啟動閘道失敗', error);
+  }
+  monitor(generation);
+}
+initializeGateway();
 
 document.getElementById('model-provider').addEventListener('change', () => {
   ++discoveryGeneration;
