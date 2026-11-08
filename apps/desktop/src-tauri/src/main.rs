@@ -5,7 +5,6 @@ use agg_core::{attribution, instance, pin, registry::SourceKind, oauth::{AuthSta
 use std::{path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 use tauri::{Manager, State};
 
-#[derive(Default)]
 struct Gateway {
     process: Option<Supervisor>,
     runtime: Option<PathBuf>,
@@ -17,10 +16,19 @@ struct Gateway {
     antigravity: Option<OAuthClient>,
     retain_on_exit: bool,
 }
+impl Default for Gateway {
+    fn default() -> Self {
+        Self { process: None, runtime: None, instance_lock: None, run_guard: None,
+            management_key: None, gateway_key: None, codex: None, antigravity: None,
+            retain_on_exit: true }
+    }
+}
 impl Drop for Gateway {
     fn drop(&mut self) {
         if !self.retain_on_exit {
             let _ = self.stop();
+        } else if let Some(process) = self.process.as_mut() {
+            process.detach();
         }
     }
 }
@@ -44,6 +52,39 @@ impl Gateway {
     }
 }
 type Shared = Arc<Mutex<Gateway>>;
+
+#[tauri::command]
+fn auto_start_enabled() -> bool {
+    std::env::var("APP_AGG_AUTO_START").ok().as_deref() == Some("1")
+}
+
+fn codex_config_path(custom_path: Option<String>) -> Result<PathBuf, String> {
+    if let Some(path) = custom_path.filter(|s| !s.trim().is_empty()) { return Ok(PathBuf::from(path)); }
+    let codex_home = std::env::var("CODEX_HOME").ok();
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+    agg_core::codex::detect_codex_home(codex_home.as_deref(), home.as_deref(), std::env::consts::OS)
+        .map(|info| info.cli_config_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn codex_suspend(custom_path: Option<String>) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = codex_config_path(custom_path)?;
+        agg_core::codex::suspend_config(&path).map_err(|e| e.to_string())
+    }).await.map_err(|_| "切換原生設定失敗".to_string())?
+}
+
+#[tauri::command]
+async fn codex_resume(state: State<'_, Shared>, custom_path: Option<String>) -> Result<bool, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let gw = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
+        let port = gw.process.as_ref().ok_or("閘道未啟動")?.port;
+        let key = gw.gateway_key.as_deref().ok_or("閘道金鑰不可用")?;
+        let path = codex_config_path(custom_path)?;
+        agg_core::codex::resume_config(&path, port, key).map_err(|e| e.to_string())
+    }).await.map_err(|_| "恢復閘道設定失敗".to_string())?
+}
 
 fn ensure_local_keys(dir: &std::path::Path) -> Result<(String, String), String> {
     agg_core::instance::ensure_local_keys(dir)
@@ -124,8 +165,6 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
                 if let Some(pid) = child_pid {
                     let _ = std::fs::write(lock_dir.join("gateway.pid"), pid.to_string());
                 }
-                gateway.retain_on_exit = true;
-
                 // 自動同步本機登入憑證至 ChatGPT Desktop (auth.json)，保持桌面端帳號登入態
                 let env_codex = std::env::var("CODEX_HOME").ok();
                 let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
@@ -137,8 +176,8 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
                 }
                 Ok(port)
             }
-            Err(_) => {
-                let _ = std::fs::remove_file(&guard_path);
+            Err(failure) => {
+                if failure.child_absent { let _ = std::fs::remove_file(&guard_path); }
                 Err("閘道啟動失敗；請先檢查核心日誌".into())
             }
         }
@@ -151,7 +190,6 @@ async fn stop_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Result
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut gw = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
-        gw.retain_on_exit = false;
         gw.stop()?;
         let _ = std::fs::remove_file(lock_dir.join("gateway.pid"));
         Ok(())
@@ -400,7 +438,7 @@ async fn inspect_previous_gateway(app: tauri::AppHandle) -> Result<String, Strin
     tauri::async_runtime::spawn_blocking(move || {
         let guard = dir.join("gateway.running");
         if !guard.exists() { return Ok("沒有上次啟動保護紀錄。".to_string()); }
-        let runtime = instance::guard_runtime(&guard).map_err(|_| "保護紀錄缺少可辨識的目錄；需人工檢查，保護仍保留。".to_string())?;
+        let runtime = instance::desktop_guard_runtime(&guard, &dir.join("runtime")).map_err(|_| "保護紀錄缺少可辨識的目錄；需人工檢查，保護仍保留。".to_string())?;
         #[cfg(target_os = "macos")]
         {
             let output = std::process::Command::new("/bin/ps").args(["-axo", "command="])
@@ -424,7 +462,8 @@ async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let guard = dir.join("gateway.running");
         if !guard.exists() { return Ok("沒有啟動保護紀錄需要清除".into()); }
-        let runtime = instance::guard_runtime(&guard)?;
+        let _lock = instance::acquire(&dir.join("gateway.lock"))?;
+        let runtime = instance::desktop_guard_runtime(&guard, &dir.join("runtime"))?;
         #[cfg(target_os = "macos")]
         {
             let output = std::process::Command::new("/bin/ps").args(["-axo", "command="])
@@ -438,9 +477,12 @@ async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
                 return Err("偵測到舊核心程序仍在執行中，請先終止舊程序後再清除保護".into());
             }
         }
-        let _ = std::fs::remove_dir_all(&runtime);
+        #[cfg(not(target_os = "macos"))]
+        return Err("此平台尚無法確認舊核心是否停止；保護紀錄仍保留".into());
+        #[cfg(target_os = "macos")]
         std::fs::remove_file(&guard).map_err(|e| format!("無法移除啟動保護檔：{e}"))?;
-        Ok("已確認舊程序停止，成功清理上次暫存與保護紀錄".into())
+        #[cfg(target_os = "macos")]
+        Ok("已確認舊程序停止並移除保護紀錄；登入憑證已保留".into())
     }).await.map_err(|_| "清除工作失敗".to_string())?
 }
 
@@ -613,9 +655,9 @@ async fn codex_rollback(custom_path: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn sync_chatgpt_auth() -> Result<agg_core::codex::AuthSyncSummary, String> {
+async fn sync_chatgpt_auth(app: tauri::AppHandle) -> Result<agg_core::codex::AuthSyncSummary, String> {
+    let app_data = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        let app_data = instance::default_app_data_dir().map_err(|e| e.to_string())?;
         let auth_dir = app_data.join("runtime").join("auth");
         let env_codex = std::env::var("CODEX_HOME").ok();
         let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
@@ -654,7 +696,7 @@ fn main() {
     }
     let app = tauri::Builder::default().manage(Arc::new(Mutex::new(Gateway::default())) as Shared)
         .invoke_handler(tauri::generate_handler![
-            start_gateway, stop_gateway, set_retain_on_exit, gateway_status, inspect_previous_gateway, clear_run_guard,
+            auto_start_enabled, start_gateway, stop_gateway, codex_suspend, codex_resume, set_retain_on_exit, gateway_status, inspect_previous_gateway, clear_run_guard,
             oauth_start, oauth_action, discovered_models, verify_model_roundtrip, log_message,
             codex_detect, codex_status, codex_preview, codex_apply, codex_rollback, sync_model_catalog, sync_chatgpt_auth
         ])

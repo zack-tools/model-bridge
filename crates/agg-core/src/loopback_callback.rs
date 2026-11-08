@@ -108,6 +108,8 @@ fn run_server_loop(
                     continue;
                 }
 
+                // Accepted sockets can inherit nonblocking mode on some platforms.
+                if stream.set_nonblocking(false).is_err() { continue; }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
 

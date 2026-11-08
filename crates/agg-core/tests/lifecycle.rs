@@ -104,3 +104,17 @@ fn detects_exit_after_initial_health() {
     supervisor.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn detached_supervisor_leaves_child_running() {
+    let dir = work_dir("detach");
+    let mut supervisor = start(&dir, "healthy", Duration::from_secs(3)).unwrap();
+    let pid = supervisor.pid().unwrap().to_string();
+    supervisor.detach();
+    drop(supervisor);
+    let alive = std::process::Command::new("/bin/kill").args(["-0", &pid]).status().unwrap().success();
+    let killed = std::process::Command::new("/bin/kill").args(["-KILL", &pid]).status().unwrap().success();
+    assert!(alive && killed, "detached child must remain alive until explicitly stopped");
+    let _ = std::fs::remove_dir_all(dir);
+}

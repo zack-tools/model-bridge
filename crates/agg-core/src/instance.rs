@@ -45,6 +45,17 @@ pub fn guard_runtime(path: &Path) -> Result<PathBuf, String> {
     Ok(runtime)
 }
 
+/// Read a desktop guard only if it points to this application's runtime.
+pub fn desktop_guard_runtime(path: &Path, expected: &Path) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read run guard: {e}"))?;
+    if bytes.len() > 4096 { return Err("run guard is too large".into()); }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "invalid run guard")?;
+    if value["version"] != 1 { return Err("unsupported run guard version".into()); }
+    let runtime = PathBuf::from(value["runtime"].as_str().ok_or("missing runtime")?);
+    if !runtime.is_absolute() || runtime != expected { return Err("unexpected runtime path".into()); }
+    Ok(runtime)
+}
+
 /// 預設應用程式資料目錄（跨平台相容）
 pub fn default_app_data_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))

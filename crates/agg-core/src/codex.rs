@@ -347,12 +347,12 @@ pub fn sync_chatgpt_desktop_auth(
     runtime_creds.sort_by(|a, b| {
         b.last_refresh.as_deref().unwrap_or("").cmp(a.last_refresh.as_deref().unwrap_or(""))
     });
-    let best_runtime = runtime_creds.first().cloned();
 
     // 2. 讀取現有 ~/.codex/auth.json
     let (mut desktop_val, auth_existed) = if auth_path.exists() {
         let content = fs::read_to_string(&auth_path).map_err(|e| CodexError::Message(e.to_string()))?;
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| CodexError::Message(format!("auth.json parse: {e}")))?;
         (v, true)
     } else {
         (serde_json::json!({
@@ -382,6 +382,25 @@ pub fn sync_chatgpt_desktop_auth(
         .to_string();
 
     let has_valid_desktop = !desktop_access_token.is_empty() && !desktop_refresh_token.is_empty();
+    let desktop_account = desktop_val.get("tokens").and_then(|t| t.get("account_id"))
+        .and_then(|v| v.as_str()).filter(|id| !id.is_empty());
+    let best_runtime = if has_valid_desktop && !runtime_creds.is_empty() {
+        let matching: Vec<_> = runtime_creds.iter().filter(|rt| {
+            match (desktop_account, rt.account_id.as_deref().filter(|id| !id.is_empty())) {
+                (Some(desktop), Some(runtime)) => desktop == runtime,
+                _ => desktop_access_token == rt.access_token && desktop_refresh_token == rt.refresh_token,
+            }
+        }).collect();
+        if matching.len() != 1 {
+            return Err(CodexError::Message("無法唯一確認兩端為同一帳號；未同步憑證".into()));
+        }
+        matching.first().map(|rt| (*rt).clone())
+    } else {
+        if runtime_creds.len() > 1 {
+            return Err(CodexError::Message("閘道有多個帳號；未自動選擇憑證".into()));
+        }
+        runtime_creds.first().cloned()
+    };
 
     // 3. 雙向同步決策
     if let Some(rt) = best_runtime {
@@ -624,6 +643,85 @@ struct Ownership {
     managed_provider_id: String,
     backup: Option<String>,
     created: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256_without_model: Option<String>,
+}
+
+fn hash_without_model(text: &str) -> Result<String, CodexError> {
+    let mut doc = text.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+    doc.remove("model");
+    Ok(crate::pin::sha256_bytes(doc.to_string().as_bytes()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct SuspendedConfig {
+    active: String,
+    native_hash: String,
+}
+
+fn suspended_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!("{}.app-agg-001.suspended.json", path.file_name().and_then(|s| s.to_str()).unwrap_or("config.toml")))
+}
+
+/// Switch a verified managed configuration to the client's native defaults.
+pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
+    reject_symlink(path)?;
+    let marker = suspended_path(path);
+    reject_symlink(&marker)?;
+    if marker.exists() { return Err(CodexError::Message("已有尚未恢復的閘道設定".into())); }
+    let Some(mut owner) = read_ownership(&ownership_path(path))? else { return Ok(false); };
+    let active = read_existing(path)?;
+    if crate::pin::sha256_bytes(active.as_bytes()) != owner.sha256 {
+        let reference = if let Some(hash) = &owner.sha256_without_model {
+            hash.clone()
+        } else {
+            let name = owner.backup.as_deref().ok_or(CodexError::ExternalEdit)?;
+            if name.contains('/') || name.contains('\\') || name.contains("..") { return Err(CodexError::ExternalEdit); }
+            let backup = read_existing(&path.with_file_name(name))?;
+            if top_level_string(&backup, "model_provider").as_deref() != Some(PROVIDER_ID) { return Err(CodexError::ExternalEdit); }
+            hash_without_model(&backup)?
+        };
+        if hash_without_model(&active)? != reference { return Err(CodexError::ExternalEdit); }
+        owner.sha256 = crate::pin::sha256_bytes(active.as_bytes());
+        owner.sha256_without_model = Some(reference);
+        let bytes = serde_json::to_vec_pretty(&owner).map_err(|e| CodexError::Message(e.to_string()))?;
+        atomic_write(&ownership_path(path), &bytes)?;
+    }
+    let mut doc = active.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+    if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER_ID) { return Err(CodexError::ForeignOwner); }
+    doc.remove("model_provider");
+    doc.remove("model_catalog_json");
+    doc.remove("model");
+    let native = doc.to_string();
+    let record = SuspendedConfig { active, native_hash: crate::pin::sha256_bytes(native.as_bytes()) };
+    let bytes = serde_json::to_vec(&record).map_err(|e| CodexError::Message(e.to_string()))?;
+    atomic_write(&marker, &bytes)?;
+    atomic_write(path, native.as_bytes())?;
+    Ok(true)
+}
+
+/// Restore a suspended managed configuration only if its native version was not edited.
+pub fn resume_config(path: &Path, port: u16, gateway_key: &str) -> Result<bool, CodexError> {
+    reject_symlink(path)?;
+    let marker = suspended_path(path);
+    reject_symlink(&marker)?;
+    if !marker.exists() { return Ok(false); }
+    let record: SuspendedConfig = serde_json::from_slice(&fs::read(&marker).map_err(|e| CodexError::Message(e.to_string()))?)
+        .map_err(|e| CodexError::Message(e.to_string()))?;
+    let current = read_existing(path)?;
+    if crate::pin::sha256_bytes(current.as_bytes()) != record.native_hash { return Err(CodexError::ExternalEdit); }
+    let mut owner = read_ownership(&ownership_path(path))?.ok_or(CodexError::NothingToRollBack)?;
+    if crate::pin::sha256_bytes(record.active.as_bytes()) != owner.sha256 { return Err(CodexError::RollbackConflict); }
+    let req = ApplyRequest { config_path: path.to_path_buf(), base_url: format!("http://127.0.0.1:{port}/v1"), gateway_key: gateway_key.into(), model: None, allow_foreign_override: false, model_catalog_json: None };
+    validate_request(&req)?;
+    let active = mutate(&record.active, &req)?;
+    owner.sha256 = crate::pin::sha256_bytes(active.as_bytes());
+    owner.sha256_without_model = Some(hash_without_model(&active)?);
+    atomic_write(path, active.as_bytes())?;
+    let body = serde_json::to_vec_pretty(&owner).map_err(|e| CodexError::Message(e.to_string()))?;
+    atomic_write(&ownership_path(path), &body)?;
+    fs::remove_file(marker).map_err(|e| CodexError::Message(e.to_string()))?;
+    Ok(true)
 }
 
 pub fn preview_apply(req: &ApplyRequest) -> Result<ApplyPreview, CodexError> {
@@ -670,6 +768,7 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
         managed_provider_id: PROVIDER_ID.into(),
         backup: backup_name,
         created: !existed,
+        sha256_without_model: Some(hash_without_model(&after)?),
     };
     let body = serde_json::to_vec_pretty(&ownership).map_err(|e| CodexError::Message(e.to_string()))?;
     atomic_write(&ownership_path, &body)?;
@@ -1190,6 +1289,84 @@ mod tests {
         assert!(arr[2]["supported_reasoning_levels"].is_array());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suspend_and_resume_managed_config_without_overwriting_edits() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        fs::write(&path, "model = \"native-model\"\nother = true\n").unwrap();
+        let mut req = req(&dir, Some("gateway-model"));
+        req.model_catalog_json = Some(dir.join("model_catalog.json"));
+        apply_config(&req).unwrap();
+        let mut edited = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        edited["model"] = toml_edit::value("user-selected-model");
+        fs::write(&path, edited.to_string()).unwrap();
+        assert!(suspend_config(&path).unwrap());
+        let native = fs::read_to_string(&path).unwrap();
+        let doc = native.parse::<DocumentMut>().unwrap();
+        assert!(doc.get("model_provider").is_none());
+        assert!(doc.get("model_catalog_json").is_none());
+        assert!(doc.get("model").is_none());
+        assert_eq!(doc["other"].as_bool(), Some(true));
+        fs::write(&path, format!("{native}\n# external change\n")).unwrap();
+        assert_eq!(resume_config(&path, 50834, "localgateway012345").unwrap_err(), CodexError::ExternalEdit);
+        fs::write(&path, native).unwrap();
+        assert!(resume_config(&path, 50834, "localgateway012345").unwrap());
+        let restored = fs::read_to_string(&path).unwrap();
+        let doc = restored.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("user-selected-model"));
+        assert_eq!(doc["model_providers"]["custom"]["base_url"].as_str(), Some("http://127.0.0.1:50834/v1"));
+        assert!(!resume_config(&path, 50834, "localgateway012345").unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn suspend_rejects_external_changes_beyond_model() {
+        let dir = scratch();
+        let req = req(&dir, Some("gateway-model"));
+        apply_config(&req).unwrap();
+        let current = fs::read_to_string(&req.config_path).unwrap();
+        fs::write(&req.config_path, format!("{current}\nexternal_setting = true\n")).unwrap();
+        assert_eq!(suspend_config(&req.config_path).unwrap_err(), CodexError::ExternalEdit);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_ownership_accepts_only_a_model_change_matching_backup() {
+        let dir = scratch();
+        let req = req(&dir, Some("old-model"));
+        apply_config(&req).unwrap();
+        apply_config(&req).unwrap();
+        let owner_path = ownership_path(&req.config_path);
+        let mut owner = read_ownership(&owner_path).unwrap().unwrap();
+        owner.sha256_without_model = None;
+        fs::write(&owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+        let mut doc = fs::read_to_string(&req.config_path).unwrap().parse::<DocumentMut>().unwrap();
+        doc["model"] = toml_edit::value("new-model");
+        fs::write(&req.config_path, doc.to_string()).unwrap();
+        assert!(suspend_config(&req.config_path).unwrap());
+        assert!(resume_config(&req.config_path, 50833, "localgateway012345").unwrap());
+        assert_eq!(top_level_string(&fs::read_to_string(&req.config_path).unwrap(), "model").as_deref(), Some("new-model"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auth_sync_rejects_different_accounts_without_writing() {
+        let dir = scratch();
+        let runtime = dir.join("runtime/auth");
+        let home = dir.join("home");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let runtime_file = runtime.join("codex-test.json");
+        let original_runtime = r#"{"access_token":"rt-access","refresh_token":"rt-refresh","account_id":"account-b","last_refresh":"2026-01-01"}"#;
+        let original_desktop = r#"{"tokens":{"access_token":"desk-access","refresh_token":"desk-refresh","account_id":"account-a"},"last_refresh":"2026-02-01"}"#;
+        fs::write(&runtime_file, original_runtime).unwrap();
+        fs::write(home.join("auth.json"), original_desktop).unwrap();
+        assert!(sync_chatgpt_desktop_auth(&runtime, &home).is_err());
+        assert_eq!(fs::read_to_string(runtime_file).unwrap(), original_runtime);
+        assert_eq!(fs::read_to_string(home.join("auth.json")).unwrap(), original_desktop);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

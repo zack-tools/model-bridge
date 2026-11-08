@@ -40,3 +40,15 @@ fn legacy_and_malformed_guards_stay_untrusted() {
     assert!(path.exists());
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn desktop_guard_accepts_only_the_expected_runtime() {
+    let dir = std::env::temp_dir().join(format!("agg-desktop-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let guard = dir.join("gateway.running");
+    let runtime = dir.join("runtime");
+    instance::create_run_guard(&guard, &runtime).unwrap();
+    assert_eq!(instance::desktop_guard_runtime(&guard, &runtime).unwrap(), runtime);
+    assert!(instance::desktop_guard_runtime(&guard, &dir.join("other")).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
