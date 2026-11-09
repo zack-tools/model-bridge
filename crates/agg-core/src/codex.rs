@@ -28,6 +28,8 @@ pub enum CodexError {
     AuthJsonTarget,
     ParentMissing,
     RollbackConflict,
+    /// Ownership written before per-key snapshots. Refusal is intentional.
+    LegacyOwnership { backup: Option<String> },
     NothingToRollBack,
     Message(String),
 }
@@ -42,6 +44,14 @@ impl std::fmt::Display for CodexError {
             Self::AuthJsonTarget => write!(f, "refusing to edit auth.json"),
             Self::ParentMissing => write!(f, "config parent directory does not exist"),
             Self::RollbackConflict => write!(f, "rollback refused because the file changed"),
+            Self::LegacyOwnership { backup } => {
+                write!(f, "rollback refused because the file changed. This ownership record is from an older ModelBridge version and has no per-key snapshot, so foreign tables cannot be kept safely. ")?;
+                if let Some(backup) = backup {
+                    write!(f, "Restore manually by copying `{backup}` over the config file. Earlier `config.toml.<n>.model-bridge.bak` files in the same directory are older generations. Then delete `config.toml.model-bridge.ownership.json`.")
+                } else {
+                    write!(f, "That version stored no numbered .bak because it created the file. Remove the managed keys by hand, or delete the config, then delete `config.toml.model-bridge.ownership.json`.")
+                }
+            }
             Self::NothingToRollBack => write!(f, "no ownership record to roll back"),
             Self::Message(s) => write!(f, "{s}"),
         }
@@ -751,35 +761,46 @@ fn parse_doc(text: &str) -> Result<DocumentMut, CodexError> {
     text.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))
 }
 
-/// Keep the pre-ModelBridge document and overlay tables this tool does not own.
-fn merge_foreign_tables(baseline: &str, current: &str) -> Result<String, CodexError> {
-    let mut base = parse_doc(baseline)?;
-    let cur = parse_doc(current)?;
-    let keys: Vec<String> = cur.iter().map(|(key, _)| key.to_string()).collect();
+fn force_explicit(item: &mut Item) {
+    if let Some(table) = item.as_table_mut() {
+        table.set_implicit(false);
+        let keys: Vec<String> = table.iter().map(|(key, _)| key.to_string()).collect();
+        for key in keys {
+            if let Some(child) = table.get_mut(&key) {
+                force_explicit(child);
+            }
+        }
+    } else if let Some(array) = item.as_array_of_tables_mut() {
+        for table in array.iter_mut() {
+            table.set_implicit(false);
+        }
+    }
+}
+
+/// Current document with ModelBridge keys removed. Foreign tables stay in place.
+fn without_managed_keys(text: &str) -> Result<DocumentMut, CodexError> {
+    let mut doc = parse_doc(text)?;
+    doc.remove("model_provider");
+    doc.remove("model");
+    doc.remove("model_catalog_json");
+    if let Some(table) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+        table.remove(PROVIDER_ID);
+        table.remove("app_agg_001");
+        if table.is_empty() {
+            doc.remove("model_providers");
+        }
+    }
+    let keys: Vec<String> = doc.iter().map(|(key, _)| key.to_string()).collect();
     for key in keys {
-        if key == "model_providers" || key == "model_provider" || key == "model" || key == "model_catalog_json" {
-            continue;
-        }
-        if cur.get(&key).is_some_and(is_toml_table) {
-            if let Some(item) = cur.get(&key).cloned() {
-                base.insert(&key, item);
-            }
+        if let Some(item) = doc.get_mut(&key) {
+            force_explicit(item);
         }
     }
-    if let Some(providers) = cur.get("model_providers").and_then(Item::as_table) {
-        let foreign: Vec<(String, Item)> = providers
-            .iter()
-            .filter(|(key, _)| !is_managed_provider(key))
-            .map(|(key, item)| (key.to_string(), item.clone()))
-            .collect();
-        if !foreign.is_empty() {
-            let dest = nested_table(base.as_table_mut(), "model_providers")?;
-            for (key, item) in foreign {
-                dest.insert(&key, item);
-            }
-        }
-    }
-    Ok(base.to_string())
+    Ok(doc)
+}
+
+fn has_foreign_table(doc: &DocumentMut) -> bool {
+    doc.iter().any(|(_, item)| is_toml_table(item) || item.is_array_of_tables())
 }
 
 fn local_backup_name(name: &str) -> Result<(), CodexError> {
@@ -965,6 +986,9 @@ pub fn rollback_config(config_path: &Path) -> Result<(), CodexError> {
         None => false,
     };
     if !full_match && !managed_match {
+        if ownership.sha256_managed.is_none() {
+            return Err(CodexError::LegacyOwnership { backup: ownership.backup.clone() });
+        }
         return Err(CodexError::RollbackConflict);
     }
     let parent = config_path.parent().ok_or(CodexError::ParentMissing)?;
@@ -972,24 +996,19 @@ pub fn rollback_config(config_path: &Path) -> Result<(), CodexError> {
         created: ownership.created,
         backup: ownership.backup.clone(),
     });
-    let baseline = if let Some(backup_name) = &origin.backup {
+    let stripped = without_managed_keys(current_text)?;
+    if has_foreign_table(&stripped) {
+        // Keep the live document's foreign tables, including ones Codex wrote
+        // as an implicit [projects."<dir>"] parent. Do not delete the file.
+        atomic_write(config_path, stripped.to_string().as_bytes())?;
+    } else if let Some(backup_name) = &origin.backup {
         local_backup_name(backup_name)?;
-        fs::read(parent.join(backup_name)).map_err(|e| CodexError::Message(e.to_string()))?
+        let bytes = fs::read(parent.join(backup_name)).map_err(|e| CodexError::Message(e.to_string()))?;
+        atomic_write(config_path, &bytes)?;
     } else if origin.created {
-        Vec::new()
-    } else {
-        return Err(CodexError::NothingToRollBack);
-    };
-    let restored = if full_match {
-        baseline
-    } else {
-        let baseline_text = std::str::from_utf8(&baseline).map_err(|_| CodexError::Message("backup is not utf-8".into()))?;
-        merge_foreign_tables(baseline_text, current_text)?.into_bytes()
-    };
-    if restored.iter().all(u8::is_ascii_whitespace) && origin.created && origin.backup.is_none() {
         fs::remove_file(config_path).map_err(|e| CodexError::Message(e.to_string()))?;
     } else {
-        atomic_write(config_path, &restored)?;
+        return Err(CodexError::NothingToRollBack);
     }
     fs::remove_file(&ownership_path).map_err(|e| CodexError::Message(e.to_string()))?;
     if let Some(parent) = config_path.parent() {
@@ -1317,6 +1336,65 @@ mod tests {
     }
 
     #[test]
+    fn rollback_keeps_codex_implicit_projects_table() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let project = dir.display().to_string();
+        let mut apply = req(&dir, Some("gemini-3-flash"));
+        apply_config(&apply).unwrap();
+        apply.model = Some("gpt-6-sol".into());
+        apply_config(&apply).unwrap();
+        let mut doc = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        {
+            let root = doc.as_table_mut();
+            let mut projects_tbl = toml_edit::Table::new();
+            projects_tbl.set_implicit(true);
+            root.insert("projects", Item::Table(projects_tbl));
+        }
+        let projects_tbl = doc["projects"].as_table_mut().unwrap();
+        projects_tbl.insert(&project, toml_edit::table());
+        let proj_tbl = projects_tbl.get_mut(&project).unwrap().as_table_mut().unwrap();
+        proj_tbl.set_implicit(false);
+        proj_tbl["trust_level"] = toml_edit::value("trusted");
+        let written = doc.to_string();
+        assert!(written.contains("trust_level"), "{written}");
+        fs::write(&path, &written).unwrap();
+        rollback_config(&path).unwrap();
+        assert!(path.is_file(), "deleted despite foreign table. written was:\n{written}");
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(restored.contains("trust_level"), "restored:\n{restored}");
+        let restored = restored.parse::<DocumentMut>().unwrap();
+        assert!(restored.get("model").is_none());
+        assert!(restored.get("model_provider").is_none());
+        assert!(restored.get("model_providers").is_none());
+        assert_eq!(project_trust(&restored, &project), Some("trusted"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_keeps_project_trust_written_the_way_codex_assigns_it() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let project = dir.display().to_string();
+        let mut apply = req(&dir, Some("gemini-3-flash"));
+        apply_config(&apply).unwrap();
+        apply.model = Some("gpt-6-sol".into());
+        apply_config(&apply).unwrap();
+        let mut doc = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        doc["projects"][&project]["trust_level"] = toml_edit::value("trusted");
+        fs::write(&path, doc.to_string()).unwrap();
+        rollback_config(&path).unwrap();
+        assert!(path.exists(), "created file with a foreign table must not be deleted");
+        let restored = fs::read_to_string(&path).unwrap();
+        let restored = restored.parse::<DocumentMut>().unwrap();
+        assert!(restored.get("model").is_none());
+        assert!(restored.get("model_provider").is_none());
+        assert!(restored.get("model_providers").is_none());
+        assert_eq!(project_trust(&restored, &project), Some("trusted"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rollback_keeps_codex_project_trust_across_two_applies_that_created_the_file() {
         let dir = scratch();
         let path = dir.join("config.toml");
@@ -1333,12 +1411,43 @@ mod tests {
         let before = fs::read_to_string(&path).unwrap();
         assert!(before.contains("gpt-6-sol"));
         rollback_config(&path).unwrap();
-        let restored = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        assert!(path.is_file(), "a created file that gained a foreign table must stay on disk");
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("trust_level"));
+        assert!(!raw.contains("model_provider"));
+        assert!(!raw.contains("gpt-6-sol"));
+        assert!(!raw.contains("gemini-3-flash"));
+        let restored = raw.parse::<DocumentMut>().unwrap();
         assert!(restored.get("model").is_none());
         assert!(restored.get("model_provider").is_none());
         assert!(restored.get("model_providers").is_none());
         assert_eq!(project_trust(&restored, &project), Some("trusted"));
         assert!(!ownership_path(&path).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_ownership_without_per_key_snapshot_names_the_bak() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let project = dir.display().to_string();
+        apply_config(&req(&dir, Some("gemini-3-flash"))).unwrap();
+        apply_config(&req(&dir, Some("gpt-6-sol"))).unwrap();
+        append_project_trust(&path, &project);
+        let owner_path = ownership_path(&path);
+        let mut stored: serde_json::Value = serde_json::from_str(&fs::read_to_string(&owner_path).unwrap()).unwrap();
+        let backup = stored["backup"].as_str().unwrap().to_string();
+        stored.as_object_mut().unwrap().remove("origin");
+        stored.as_object_mut().unwrap().remove("sha256_managed");
+        fs::write(&owner_path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let err = rollback_config(&path).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("older ModelBridge version"), "{message}");
+        assert!(message.contains(&backup), "{message}");
+        assert!(message.contains("config.toml.model-bridge.ownership.json"), "{message}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(owner_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
