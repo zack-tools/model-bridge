@@ -38,7 +38,7 @@ ChatGPT Desktop／Codex GUI 的路徑與重啟條件，macOS、Windows、Linux �
 
 套用只改呼叫者給的暫存檔。它會預覽 diff、同目錄備份、原子改名，並保留無關 TOML 與註解。`model_provider` 使用 `custom`，提供者名稱 `name` 為 `Custom`，`wire_api` 為 `responses`，`requires_openai_auth` 為 true，閘道金鑰放在 `experimental_bearer_token` 與 `http_headers.X-Api-Key`。啟動、套用與 `--daemon` 不讀寫 `auth.json`。閘道登入只來自它自己的 OAuth。明確的預覽與確認可以移除桌面檔裡已經和閘道相同的 refresh token，而且必須先寫成 `auth.json.<世代>.model-bridge.bak`；備份失敗就不改檔，也不把 refresh token 複製到另一端。預覽裡的金鑰會紅化，磁碟上的設定仍要有金鑰，Codex 才送得出去。
 
-已有別的 `model_provider`、內文出現 `cc-switch`，或所有權雜湊對不上，就拒絕覆蓋。還原比對我們管理的 `model_provider`、`model`、`model_catalog_json` 與 `[model_providers.custom]`（以及既有的 `app_agg_001`）。只多了我們不擁有的表（例如 Codex 寫入的 `[projects.*]`）仍可還原，那些表留在結果裡。多次套用後一次還原回到第一次寫入前的內容。
+已有別的 `model_provider`、內文出現 `cc-switch`，或所有權雜湊對不上，就拒絕覆蓋。還原比對我們管理的 `model_provider`、`model`、`model_catalog_json` 與 `[model_providers.custom]`（以及既有的 `app_agg_001`）。只多了我們不擁有的表（例如 Codex 寫入的 `[projects.*]`）仍可還原，那些表留在結果裡。檔案若是 ModelBridge 建立的，沒有外來表才刪除；有外來表就留下只含那些表的 `config.toml`，不含 `model`、`model_provider` 與我們管理的 provider。多次套用後一次還原回到第一次寫入前的內容。沒有逐鍵快照的舊 ownership 在檔案已變時拒絕，並指出旁邊的編號 `.bak`。
 
 ## 模型與登入狀態
 
