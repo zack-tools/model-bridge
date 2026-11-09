@@ -59,9 +59,68 @@ impl From<&str> for StartFailure {
     fn from(message: &str) -> Self { Self::from(message.to_string()) }
 }
 
+/// Result of the only production sidecar launch.
+#[derive(Debug)]
+pub struct VerifiedSpawn {
+    pub binary_sha256: String,
+    pub supervisor: Supervisor,
+}
+
+/// Pin failure happens before any process is created. Start failure happens
+/// only after the pinned checksum and archive member both matched.
+#[derive(Debug)]
+pub enum SpawnVerifiedError {
+    Pin(String),
+    Start(StartFailure, String),
+}
+
+impl SpawnVerifiedError {
+    pub fn child_absent(&self) -> bool {
+        match self {
+            Self::Pin(_) => true,
+            Self::Start(failure, _) => failure.child_absent,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Pin(message) => message,
+            Self::Start(failure, _) => failure.message.as_str(),
+        }
+    }
+}
+
+/// Every production launch uses one of these labels and the same
+/// verify-then-spawn function. Mock tests call `Supervisor::start` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarLaunch {
+    DesktopGateway,
+    HeadlessDaemon,
+    PocStart,
+    CoreCheck,
+}
+
+impl SidecarLaunch {
+    pub fn spawn(self, archive: &Path, request: StartRequest) -> Result<VerifiedSpawn, SpawnVerifiedError> {
+        let _ = self;
+        Supervisor::spawn_verified(archive, request)
+    }
+}
+
 impl Supervisor {
     pub fn start(req: StartRequest) -> Result<Self, String> {
         Self::start_detailed(req).map_err(|failure| failure.message)
+    }
+
+    /// Verify the pinned archive and the on-disk executable, then spawn.
+    /// A checksum or member mismatch returns before `Command` runs.
+    pub fn spawn_verified(archive: &Path, request: StartRequest) -> Result<VerifiedSpawn, SpawnVerifiedError> {
+        let binary_sha256 = crate::pin::verify_native_binary(archive, &request.program)
+            .map_err(SpawnVerifiedError::Pin)?;
+        match Self::start_detailed(request) {
+            Ok(supervisor) => Ok(VerifiedSpawn { binary_sha256, supervisor }),
+            Err(failure) => Err(SpawnVerifiedError::Start(failure, binary_sha256)),
+        }
     }
 
     pub fn start_detailed(req: StartRequest) -> Result<Self, StartFailure> {

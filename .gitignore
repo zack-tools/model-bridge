@@ -10,6 +10,9 @@
 /vendor/cliproxyapi/bin/
 /agent-tools/
 
+# macOS acceptance handoff (isolated HOME, CODEX_HOME, app data)
+.handoff/
+
 # Sensitive data and local credentials
 *.log
 .env

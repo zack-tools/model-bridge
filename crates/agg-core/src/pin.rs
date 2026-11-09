@@ -52,6 +52,17 @@ pub fn expected_sha256(archive_name: &str) -> Option<&'static str> {
     None
 }
 
+pub fn native_archive_name() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok(LINUX_AMD64_ARCHIVE),
+        ("macos", "aarch64") => Ok("CLIProxyAPI_8.0.57_darwin_aarch64.tar.gz"),
+        ("macos", "x86_64") => Ok("CLIProxyAPI_8.0.57_darwin_amd64.tar.gz"),
+        ("windows", "x86_64") => Ok("CLIProxyAPI_8.0.57_windows_amd64.zip"),
+        ("windows", "aarch64") => Ok("CLIProxyAPI_8.0.57_windows_aarch64.zip"),
+        _ => Err("no verified native archive mapping for this platform".into()),
+    }
+}
+
 pub fn verify_archive(path: &Path, archive_name: &str) -> Result<String, String> {
     let expected = expected_sha256(archive_name)
         .ok_or_else(|| format!("archive {archive_name} is not in the pinned checksum list"))?;
@@ -67,14 +78,7 @@ pub fn verify_archive(path: &Path, archive_name: &str) -> Result<String, String>
 /// Verify both the platform archive and the executable extracted from it.
 /// The executable must match the exact member of the checksum-pinned archive.
 pub fn verify_native_binary(archive: &Path, binary: &Path) -> Result<String, String> {
-    let archive_name = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => LINUX_AMD64_ARCHIVE,
-        ("macos", "aarch64") => "CLIProxyAPI_8.0.57_darwin_aarch64.tar.gz",
-        ("macos", "x86_64") => "CLIProxyAPI_8.0.57_darwin_amd64.tar.gz",
-        ("windows", "x86_64") => "CLIProxyAPI_8.0.57_windows_amd64.zip",
-        ("windows", "aarch64") => "CLIProxyAPI_8.0.57_windows_aarch64.zip",
-        _ => return Err("no verified native archive mapping for this platform".into()),
-    };
+    let archive_name = native_archive_name()?;
     verify_archive(archive, archive_name)?;
     let binary_sha = sha256_file(binary)?;
     let archive_binary_sha = if archive_name.ends_with(".zip") {

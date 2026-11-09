@@ -2,6 +2,7 @@
 name = "model-bridge-desktop"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.90"
 publish = false
 description = "model-bridge phase 1 thin Tauri shell. Not compiled in the headless PoC run."
 

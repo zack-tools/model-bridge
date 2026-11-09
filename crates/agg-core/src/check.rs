@@ -9,7 +9,7 @@ use crate::oauth::{AccountSession, AuthState, FailureClass, PollOutcome, Provide
 use crate::pin;
 use crate::redact::Redactor;
 use crate::registry::{is_claude, CatalogModel, ModelRegistry, ModelStatus};
-use crate::supervisor::{inspect_listeners, Supervisor, StartRequest};
+use crate::supervisor::{inspect_listeners, SidecarLaunch, SpawnVerifiedError, StartRequest};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
@@ -55,23 +55,8 @@ pub struct CoreCheckReport {
     pub notes: Vec<String>,
 }
 
-pub fn run_pinned_core_check(archive: &Path, binary: &Path) -> Result<CoreCheckReport, String> {
-    let observed_binary_sha256 = pin::verify_native_binary(archive, binary)?;
-    let home_marker = Path::new(&std::env::var("HOME").map_err(|_| "HOME is not set")?)
-        .join(".cli-proxy-api");
-    let home_existed = home_marker.exists();
-
-    let gateway_key = random_token("agglocal")?;
-    let management_password = random_token("mgmt")?;
-    let redactor = Redactor::new([gateway_key.clone(), management_password.clone()]);
-    let work = std::env::temp_dir().join(format!(
-        "agg-core-check-{}",
-        &pin::sha256_bytes(gateway_key.as_bytes())[..12]
-    ));
-    let _ = fs::remove_dir_all(&work);
-    fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-
-    let mut report = CoreCheckReport {
+fn base_report(observed_binary_sha256: String) -> CoreCheckReport {
+    CoreCheckReport {
         core_version_pin: pin::CORE_VERSION.into(),
         core_git_sha: pin::CORE_GIT_SHA.into(),
         archive_sha256_ok: true,
@@ -95,9 +80,25 @@ pub fn run_pinned_core_check(archive: &Path, binary: &Path) -> Result<CoreCheckR
         oauth: Vec::new(),
         version_line: None,
         notes: Vec::new(),
-    };
+    }
+}
 
-    let supervisor = Supervisor::start(StartRequest {
+pub fn run_pinned_core_check(archive: &Path, binary: &Path) -> Result<CoreCheckReport, String> {
+    let home_marker = Path::new(&std::env::var("HOME").map_err(|_| "HOME is not set")?)
+        .join(".cli-proxy-api");
+    let home_existed = home_marker.exists();
+
+    let gateway_key = random_token("agglocal")?;
+    let management_password = random_token("mgmt")?;
+    let redactor = Redactor::new([gateway_key.clone(), management_password.clone()]);
+    let work = std::env::temp_dir().join(format!(
+        "agg-core-check-{}",
+        &pin::sha256_bytes(gateway_key.as_bytes())[..12]
+    ));
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+
+    let spawned = SidecarLaunch::CoreCheck.spawn(archive, StartRequest {
         program: binary.to_path_buf(),
         work_dir: work.clone(),
         port: None,
@@ -106,14 +107,21 @@ pub fn run_pinned_core_check(archive: &Path, binary: &Path) -> Result<CoreCheckR
         gateway_key: gateway_key.clone(),
         management_password: management_password.clone(),
     });
-    let mut supervisor = match supervisor {
-        Ok(s) => s,
-        Err(err) => {
-            report.notes.push(redactor.redact(&err));
+    let (observed_binary_sha256, supervisor) = match spawned {
+        Ok(spawned) => (spawned.binary_sha256, spawned.supervisor),
+        Err(SpawnVerifiedError::Pin(message)) => {
+            let _ = fs::remove_dir_all(&work);
+            return Err(message);
+        }
+        Err(SpawnVerifiedError::Start(failure, binary_sha256)) => {
+            let mut report = base_report(binary_sha256);
+            report.notes.push(redactor.redact(&failure.message));
             let _ = fs::remove_dir_all(&work);
             return Ok(report);
         }
     };
+    let mut supervisor = supervisor;
+    let mut report = base_report(observed_binary_sha256);
     report.version_line = extract_version(&supervisor.redacted_logs());
 
     let health = exchange(
