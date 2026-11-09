@@ -141,7 +141,12 @@ cargo test --workspace
 
 # 執行 Tauri 桌面後端合約測試
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+# macOS：在 .handoff 隔離目錄離線檢查 rollback（不需要閘道或 OAuth）
+bash scripts/macos-rollback-selftest.sh
 ```
+
+Apple Silicon 的視窗、OAuth 與 Codex 回合見 [docs/MACOS_ARM64_HANDOFF.md](docs/MACOS_ARM64_HANDOFF.md)。交接腳本必須用 bash 執行，不要在 zsh 裡 source。
 
 ---
 

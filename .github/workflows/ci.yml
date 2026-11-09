@@ -1,0 +1,50 @@
+# TODO: add `cargo fmt --check` and `cargo clippy --workspace --all-targets`
+# to this gate after the existing warning backlog is clean. They are not required.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Build desktop app
+        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: macOS rollback selftest
+        if: runner.os == 'macOS'
+        run: bash scripts/macos-rollback-selftest.sh
