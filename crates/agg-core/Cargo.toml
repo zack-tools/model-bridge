@@ -2,6 +2,7 @@
 name = "agg-core"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 publish = false
 description = "model-bridge phase 1 shared contract for a managed CLIProxyAPI sidecar"
 

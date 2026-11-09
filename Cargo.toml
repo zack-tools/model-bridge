@@ -2,3 +2,6 @@
 resolver = "2"
 members = ["crates/agg-core"]
 exclude = ["apps/desktop/src-tauri"]
+
+[workspace.package]
+rust-version = "1.88"

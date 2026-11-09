@@ -466,7 +466,7 @@ async function checkCodexConfigStatus() {
       metricDesktop.style.color = res.managed_by_us ? '#10b981' : '#f59e0b';
     }
     if (metricDesktopHint) {
-      metricDesktopHint.textContent = res.current_model ? `預設: ${res.current_model}` : '保持登入 • 雙向同步中';
+      metricDesktopHint.textContent = res.current_model ? `預設: ${res.current_model}` : '閘道使用自己的 OAuth';
     }
 
     appendLog('INFO', `檢查 Codex 設定狀態: ${path}`, desc);
@@ -488,7 +488,7 @@ if (oneClickSetupBtn) {
     oneClickSetupBtn.textContent = '⏳ 正在執行一鍵整合…';
     if (codexStatusMsg) {
       codexStatusMsg.style.display = 'flex';
-      codexStatusMsg.textContent = '🚀 [1/3] 正在同步可用模型清單至 model_catalog.json…';
+      codexStatusMsg.textContent = '🚀 [1/2] 正在同步可用模型清單至 model_catalog.json…';
       codexStatusMsg.style.color = '#2563eb';
     }
     appendLog('INFO', '開始一鍵設定 ChatGPT Desktop 整合流程…');
@@ -505,28 +505,22 @@ if (oneClickSetupBtn) {
         summary = await window.__TAURI__.core.invoke('sync_model_catalog', {
           customCatalogPath: customCatalogPath || null
         });
-        appendLog('SUCCESS', `[1/3] 模型目錄同步完成 (總計 ${summary.total_models} 款可用模型)`);
+        appendLog('SUCCESS', `[1/2] 模型目錄同步完成 (總計 ${summary.total_models} 款可用模型)`);
       } catch (catErr) {
-        appendLog('WARN', `[1/3] 模型清單同步提示: ${catErr}`);
+        appendLog('WARN', `[1/2] 模型清單同步提示: ${catErr}`);
       }
 
-      // 步驟 2: 套用 Custom 閘道端點至 config.toml
-      if (codexStatusMsg) codexStatusMsg.textContent = '🚀 [2/3] 正在套用 Custom 閘道端點至 config.toml…';
+      // 步驟 2: 套用 Custom 閘道端點至 config.toml。不讀寫登入檔。
+      if (codexStatusMsg) codexStatusMsg.textContent = '🚀 [2/2] 正在套用 Custom 閘道端點至 config.toml…';
       const applyMsg = await window.__TAURI__.core.invoke('codex_apply', {
         customPath: customPath || null,
         model: model || null,
         allowOverride: allowOverride
       });
-      appendLog('SUCCESS', `[2/3] 套用閘道設定成功: ${applyMsg}`);
+      appendLog('SUCCESS', `[2/2] 套用閘道設定成功: ${applyMsg}`);
 
-      // 步驟 3: 雙向同步登入憑證 (auth.json)
-      if (codexStatusMsg) codexStatusMsg.textContent = '🚀 [3/3] 正在同步 ChatGPT Desktop 登入憑證 (保持登入)…';
-      const authSummary = await window.__TAURI__.core.invoke('sync_chatgpt_auth');
-      appendLog('SUCCESS', `[3/3] 登入憑證同步完成: ${authSummary.message}`);
-
-      // 完成
       const totalModels = summary ? summary.total_models : 16;
-      const doneMsg = `✅ 一鍵整合全部完成！已成功套用 Custom 供應商端點、同步 ${totalModels} 款模型目錄，並維持 ChatGPT Desktop 官方帳號登入態。`;
+      const doneMsg = `✅ 已套用 Custom 供應商端點，並同步 ${totalModels} 款模型目錄。閘道使用自己的 OAuth，沒有讀寫 Codex 登入檔。`;
       if (codexStatusMsg) {
         codexStatusMsg.textContent = doneMsg;
         codexStatusMsg.style.color = '#10b981';
@@ -554,22 +548,29 @@ if (codexSyncAuthBtn) {
   codexSyncAuthBtn.addEventListener('click', async () => {
     if (codexStatusMsg) {
       codexStatusMsg.style.display = 'flex';
-      codexStatusMsg.textContent = '正在安全雙向同步 ChatGPT Desktop 登入憑證…';
+      codexStatusMsg.textContent = '正在預覽登入隔離…';
       codexStatusMsg.style.color = '#2563eb';
     }
     try {
-      const summary = await window.__TAURI__.core.invoke('sync_chatgpt_auth');
+      const preview = await window.__TAURI__.core.invoke('preview_chatgpt_auth');
+      const accepted = window.confirm(`${preview.message}\n\n不會複製 refresh token。要執行這個明確動作嗎？`);
+      if (!accepted) {
+        if (codexStatusMsg) codexStatusMsg.textContent = '已取消。登入檔沒有變更。';
+        appendLog('INFO', '已取消登入隔離確認');
+        return;
+      }
+      const summary = await window.__TAURI__.core.invoke('confirm_chatgpt_auth');
       if (codexStatusMsg) {
         codexStatusMsg.textContent = summary.message;
         codexStatusMsg.style.color = '#10b981';
       }
-      appendLog('SUCCESS', '同步 ChatGPT Desktop 登入憑證完成', summary);
+      appendLog('SUCCESS', '已確認登入隔離', summary);
     } catch (err) {
       if (codexStatusMsg) {
-        codexStatusMsg.textContent = `憑證同步失敗: ${err}`;
+        codexStatusMsg.textContent = `登入隔離失敗: ${err}`;
         codexStatusMsg.style.color = '#ef4444';
       }
-      appendLog('ERROR', '同步 ChatGPT Desktop 憑證失敗', err);
+      appendLog('ERROR', '登入隔離失敗', err);
     }
   });
 }

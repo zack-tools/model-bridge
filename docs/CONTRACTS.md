@@ -36,7 +36,7 @@ OAuth 憑證由官方 sidecar 的 `NewFileTokenStore()` 寫入 `oauth.auth-dir` 
 
 ChatGPT Desktop／Codex GUI 的路徑與重啟條件，macOS、Windows、Linux 都還沒證明。偵測不會發明那些路徑，也不會建立家目錄。
 
-套用只改呼叫者給的暫存檔。它會預覽 diff、同目錄備份、原子改名，並保留無關 TOML 與註解。`model_provider` 使用 `custom`，提供者名稱 `name` 為 `Custom`，`wire_api` 為 `responses`，`requires_openai_auth` 為 true，閘道金鑰放在 `experimental_bearer_token` 與 `http_headers.X-Api-Key`。同時透過 `sync_chatgpt_desktop_auth` 安全同步本地憑證，維持 ChatGPT Desktop 帳號登入態。預覽裡的金鑰會紅化，磁碟上的設定仍要有金鑰，Codex 才送得出去。
+套用只改呼叫者給的暫存檔。它會預覽 diff、同目錄備份、原子改名，並保留無關 TOML 與註解。`model_provider` 使用 `custom`，提供者名稱 `name` 為 `Custom`，`wire_api` 為 `responses`，`requires_openai_auth` 為 true，閘道金鑰放在 `experimental_bearer_token` 與 `http_headers.X-Api-Key`。啟動、套用與 `--daemon` 不讀寫 `auth.json`。閘道登入只來自它自己的 OAuth。明確的預覽與確認可以移除桌面檔裡已經和閘道相同的 refresh token，而且必須先寫成 `auth.json.<世代>.model-bridge.bak`；備份失敗就不改檔，也不把 refresh token 複製到另一端。預覽裡的金鑰會紅化，磁碟上的設定仍要有金鑰，Codex 才送得出去。
 
 已有別的 `model_provider`、內文出現 `cc-switch`，或所有權雜湊對不上，就拒絕覆蓋。還原只在雜湊仍是我們寫入的那一版時進行。
 
