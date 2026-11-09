@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: macOS | Linux | Windows](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
-[![Rust](https://img.shields.io/badge/Rust-1.83%2B-orange.svg)]()
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)]()
 [![Tauri](https://img.shields.io/badge/Tauri-v2.12-24C8D8.svg)]()
 
 **將任何 AI 編輯器與桌面工具，無縫橋接至任意大語言模型的通用本機調度閘道**
@@ -19,7 +19,7 @@
 
 **ModelBridge** 是一套專為現代 AI 工作流打造的高效能本機 AI 聚合閘道與智慧模型調度中樞。
 
-以往在不同 AI 編輯器或桌面客戶端（例如 ChatGPT Desktop、Cursor、Windsurf、Claude Code、Cline 等）中，往往受限於單一廠商的封閉生態或固定模型清單。**ModelBridge** 透過在本地建立標準化的 OpenAI 相容通訊閘道，讓您能夠自由在各種工具中切換使用 GPT-4o、o1/o3-mini、Gemini 2.0/1.5 以及開源本地模型，並享有自動憑證同步與會話持久化保障。
+以往在不同 AI 編輯器或桌面客戶端（例如 ChatGPT Desktop、Cursor、Windsurf、Claude Code、Cline 等）中，往往受限於單一廠商的封閉生態或固定模型清單。**ModelBridge** 透過在本地建立標準化的 OpenAI 相容通訊閘道，讓您能夠自由在各種工具中切換使用 GPT-4o、o1/o3-mini、Gemini 2.0/1.5 以及開源本地模型。閘道使用自己的 OAuth 登入，預設不讀寫 `~/.codex/auth.json`。
 
 ---
 
@@ -107,7 +107,7 @@ flowchart TD
 
 ### 系統需求
 * **macOS** 12.0+ / **Linux** / **Windows** 10+
-* **Rust** 1.83 或更高版本
+* **Rust** 1.88 或更高版本（桌面殼需 1.90，因為 Tauri 2.12.5 的 `rust-version` 是 1.90）
 * **Git**
 
 ### 安裝與啟動

@@ -58,6 +58,16 @@ fn auto_start_enabled() -> bool {
     std::env::var("APP_AGG_AUTO_START").ok().as_deref() == Some("1")
 }
 
+fn desktop_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("APP_AGG_DATA_DIR") {
+        if value.is_empty() {
+            return Err("APP_AGG_DATA_DIR is empty".into());
+        }
+        return Ok(PathBuf::from(value));
+    }
+    app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())
+}
+
 fn codex_config_path(custom_path: Option<String>) -> Result<PathBuf, String> {
     if let Some(path) = custom_path.filter(|s| !s.trim().is_empty()) { return Ok(PathBuf::from(path)); }
     let codex_home = std::env::var("CODEX_HOME").ok();
@@ -92,7 +102,7 @@ fn ensure_local_keys(dir: &std::path::Path) -> Result<(String, String), String> 
 
 #[tauri::command]
 async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Result<u16, String> {
-    let lock_dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let lock_dir = desktop_data_dir(&app)?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut gateway = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
@@ -102,17 +112,8 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
             .map_err(|_| "另一個視窗已啟動閘道，或無法取得鎖定".to_string())?;
         let core_dir = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from).or_else(|| std::env::current_exe().ok().and_then(|p| { let mut d = p.parent()?.to_path_buf(); for _ in 0..6 { let c = d.join(".cache").join("cliproxyapi"); if c.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" }).exists() { return Some(c); } d = d.parent()?.to_path_buf(); } None }))
             .ok_or("請先設定 APP_AGG_CORE_DIR，指向已下載的核心資料夾")?;
-        let archive_name = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("macos", "aarch64") => "CLIProxyAPI_8.0.57_darwin_aarch64.tar.gz",
-            ("macos", "x86_64") => "CLIProxyAPI_8.0.57_darwin_amd64.tar.gz",
-            ("linux", "x86_64") => "CLIProxyAPI_8.0.57_linux_amd64.tar.gz",
-            ("windows", "x86_64") => "CLIProxyAPI_8.0.57_windows_amd64.zip",
-            ("windows", "aarch64") => "CLIProxyAPI_8.0.57_windows_aarch64.zip",
-            _ => return Err("此平台的核心驗證尚未實作".into()),
-        };
         let binary = core_dir.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" });
-        pin::verify_native_binary(&core_dir.join(archive_name), &binary)
-            .map_err(|_| "核心驗證失敗，請重新下載釘選版本".to_string())?;
+        let archive = core_dir.join(pin::native_archive_name()?);
         
         let (gateway_key, management_key) = ensure_local_keys(&lock_dir)?;
         let dir = lock_dir.join("runtime");
@@ -134,12 +135,13 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
         } else {
             None
         };
-        let result = Supervisor::start_detailed(StartRequest {
+        let result = agg_core::supervisor::SidecarLaunch::DesktopGateway.spawn(&archive, StartRequest {
             program: binary, work_dir: dir.clone(), port: selected_port, extra_env: vec![],
             health_timeout: Duration::from_secs(45), gateway_key: gateway_key.clone(), management_password: management_key.clone(),
         });
         match result {
-            Ok(process) => {
+            Ok(spawned) => {
+                let process = spawned.supervisor;
                 let port = process.port;
                 let child_pid = process.pid();
                 gateway.runtime = Some(dir);
@@ -165,19 +167,17 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
                 if let Some(pid) = child_pid {
                     let _ = std::fs::write(lock_dir.join("gateway.pid"), pid.to_string());
                 }
-                // 自動同步本機登入憑證至 ChatGPT Desktop (auth.json)，保持桌面端帳號登入態
-                let env_codex = std::env::var("CODEX_HOME").ok();
-                let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
-                let os = std::env::consts::OS;
-                if let Ok(info) = agg_core::codex::detect_codex_home(env_codex.as_deref(), env_home.as_deref(), os) {
-                    if let Some(parent) = info.cli_config_path.parent() {
-                        let _ = agg_core::codex::sync_chatgpt_desktop_auth(&auth_dir, parent);
-                    }
+                let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| {
+                    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(|home| PathBuf::from(home).join(".codex"))
+                });
+                if let Some(home) = codex_home {
+                    let _ = agg_core::codex::after_gateway_start(&home);
                 }
                 Ok(port)
             }
             Err(failure) => {
-                if failure.child_absent { let _ = std::fs::remove_file(&guard_path); }
+                if failure.child_absent() { let _ = std::fs::remove_file(&guard_path); }
                 Err("閘道啟動失敗；請先檢查核心日誌".into())
             }
         }
@@ -186,7 +186,7 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
 
 #[tauri::command]
 async fn stop_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Result<(), String> {
-    let lock_dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let lock_dir = desktop_data_dir(&app)?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut gw = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
@@ -295,7 +295,7 @@ async fn set_autostart_gateway(enabled: bool) -> Result<bool, String> {
 
 #[tauri::command]
 async fn gateway_status(app: tauri::AppHandle, state: State<'_, Shared>) -> Result<serde_json::Value, String> {
-    let dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let dir = desktop_data_dir(&app)?;
     let guard_path = dir.join("gateway.running");
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -566,7 +566,7 @@ async fn verify_model_roundtrip(state: State<'_, Shared>, provider: String, mode
 
 #[tauri::command]
 async fn inspect_previous_gateway(app: tauri::AppHandle) -> Result<String, String> {
-    let dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let dir = desktop_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let guard = dir.join("gateway.running");
         if !guard.exists() { return Ok("沒有上次啟動保護紀錄。".to_string()); }
@@ -609,7 +609,7 @@ async fn inspect_previous_gateway(app: tauri::AppHandle) -> Result<String, Strin
 
 #[tauri::command]
 async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
-    let dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let dir = desktop_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let guard = dir.join("gateway.running");
         if !guard.exists() { return Ok("沒有啟動保護紀錄需要清除".into()); }
@@ -778,19 +778,7 @@ async fn codex_apply(state: State<'_, Shared>, custom_path: Option<String>, mode
             model_catalog_json,
         };
         agg_core::codex::apply_config(&req).map_err(|e| e.to_string())?;
-
-        // 套用時自動同步本地憑證至 auth.json，使 ChatGPT Desktop 保持登入
-        let sync_msg = if let (Ok(app_data), Some(parent)) = (instance::default_app_data_dir(), path.parent()) {
-            let auth_dir = app_data.join("runtime").join("auth");
-            match agg_core::codex::sync_chatgpt_desktop_auth(&auth_dir, parent) {
-                Ok(s) => format!("，ChatGPT Desktop 登入狀態：{}", s.message),
-                Err(_) => String::new(),
-            }
-        } else {
-            String::new()
-        };
-
-        Ok(format!("已成功套用至 {} (備份與 ownership 檔已寫入){sync_msg}", path.display()))
+        Ok(format!("已成功套用至 {} (備份與 ownership 檔已寫入)", path.display()))
     }).await.map_err(|_| "套用工作失敗".to_string())?
 }
 
@@ -854,24 +842,37 @@ async fn codex_rollback(custom_path: Option<String>) -> Result<String, String> {
     }).await.map_err(|_| "還原工作失敗".to_string())?
 }
 
+fn codex_home_dir() -> Result<PathBuf, String> {
+    let env_codex = std::env::var("CODEX_HOME").ok();
+    let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+    let info = agg_core::codex::detect_codex_home(env_codex.as_deref(), env_home.as_deref(), std::env::consts::OS)
+        .map_err(|e| e.to_string())?;
+    info.cli_config_path.parent().map(PathBuf::from).ok_or_else(|| "無法定位 codex home 目錄".into())
+}
+
 #[tauri::command]
-async fn sync_chatgpt_auth(app: tauri::AppHandle) -> Result<agg_core::codex::AuthSyncSummary, String> {
-    let app_data = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+async fn preview_chatgpt_auth(app: tauri::AppHandle) -> Result<agg_core::codex::AuthSyncPreview, String> {
+    let app_data = desktop_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let auth_dir = app_data.join("runtime").join("auth");
-        let env_codex = std::env::var("CODEX_HOME").ok();
-        let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
-        let os = std::env::consts::OS;
-        let info = agg_core::codex::detect_codex_home(env_codex.as_deref(), env_home.as_deref(), os)
-            .map_err(|e| e.to_string())?;
-        let parent = info.cli_config_path.parent().ok_or("無法定位 codex home 目錄")?;
-        agg_core::codex::sync_chatgpt_desktop_auth(&auth_dir, parent).map_err(|e| e.to_string())
-    }).await.map_err(|_| "同步工作失敗".to_string())?
+        let parent = codex_home_dir()?;
+        agg_core::codex::preview_chatgpt_desktop_auth(&auth_dir, &parent).map_err(|e| e.to_string())
+    }).await.map_err(|_| "預覽工作失敗".to_string())?
+}
+
+#[tauri::command]
+async fn confirm_chatgpt_auth(app: tauri::AppHandle) -> Result<agg_core::codex::AuthSyncSummary, String> {
+    let app_data = desktop_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let auth_dir = app_data.join("runtime").join("auth");
+        let parent = codex_home_dir()?;
+        agg_core::codex::apply_chatgpt_desktop_auth(&auth_dir, &parent, true).map_err(|e| e.to_string())
+    }).await.map_err(|_| "確認工作失敗".to_string())?
 }
 
 #[tauri::command]
 async fn log_message(app: tauri::AppHandle, level: String, message: String, details: String) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let dir = desktop_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let log_file = dir.join("desktop.log");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -889,10 +890,19 @@ async fn log_message(app: tauri::AppHandle, level: String, message: String, deta
     }).await.map_err(|_| "日誌寫入失敗".to_string())?
 }
 
-fn run_headless_daemon() {
+fn daemon_data_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("APP_AGG_DATA_DIR") {
+        if !value.is_empty() {
+            return PathBuf::from(value);
+        }
+    }
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| format!("{home}\\AppData\\Roaming"));
-    let lock_dir = PathBuf::from(appdata).join("io.github.zacktools.modelbridge");
+    PathBuf::from(appdata).join("io.github.zacktools.modelbridge")
+}
+
+fn run_headless_daemon() {
+    let lock_dir = daemon_data_dir();
     let runtime_dir = lock_dir.join("runtime");
     let guard_path = lock_dir.join("gateway.running");
     let pid_file = lock_dir.join("gateway.pid");
@@ -915,6 +925,10 @@ fn run_headless_daemon() {
                             return;
                         }
                     }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = pid;
                 }
             }
         }
@@ -940,7 +954,10 @@ fn run_headless_daemon() {
     });
     let Some(core_dir) = core_dir else { return; };
     let binary = core_dir.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" });
-    if !binary.exists() { return; }
+    let archive = match pin::native_archive_name() {
+        Ok(name) => core_dir.join(name),
+        Err(err) => { eprintln!("{err}"); return; }
+    };
 
     let Ok((gateway_key, management_key)) = ensure_local_keys(&lock_dir) else { return; };
     let _ = std::fs::create_dir_all(&runtime_dir);
@@ -961,7 +978,7 @@ fn run_headless_daemon() {
         None
     };
 
-    let result = Supervisor::start_detailed(StartRequest {
+    let result = agg_core::supervisor::SidecarLaunch::HeadlessDaemon.spawn(&archive, StartRequest {
         program: binary,
         work_dir: runtime_dir.clone(),
         port: selected_port,
@@ -971,31 +988,33 @@ fn run_headless_daemon() {
         management_password: management_key.clone(),
     });
 
-    if let Ok(mut process) = result {
-        let port = process.port;
-        let child_pid = process.pid();
-        if let Some(pid) = child_pid {
-            let _ = std::fs::write(lock_dir.join("gateway.pid"), pid.to_string());
+    match result {
+        Ok(mut spawned) => {
+            let port = spawned.supervisor.port;
+            if let Some(pid) = spawned.supervisor.pid() {
+                let _ = std::fs::write(lock_dir.join("gateway.pid"), pid.to_string());
+            }
+            let env_codex = std::env::var("CODEX_HOME").ok();
+            let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+            if let Ok(info) = agg_core::codex::detect_codex_home(env_codex.as_deref(), env_home.as_deref(), std::env::consts::OS) {
+                let _ = agg_core::codex::after_daemon_start(&info.cli_config_path, port, &gateway_key);
+            }
+            spawned.supervisor.detach();
         }
-
-        // 同步登入憑證與自動還原 ChatGPT Desktop 連線
-        let env_codex = std::env::var("CODEX_HOME").ok();
-        let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
-        let os = std::env::consts::OS;
-        if let Ok(info) = agg_core::codex::detect_codex_home(env_codex.as_deref(), env_home.as_deref(), os) {
-            if let Some(parent) = info.cli_config_path.parent() {
-                let _ = agg_core::codex::sync_chatgpt_desktop_auth(&auth_dir, parent);
-                let _ = agg_core::codex::resume_config(&info.cli_config_path, port, &gateway_key);
+        Err(err) => {
+            eprintln!("{}", err.message());
+            if err.child_absent() {
+                let _ = std::fs::remove_file(&guard_path);
             }
         }
-
-        process.detach();
-    } else {
-        let _ = std::fs::remove_file(&guard_path);
     }
 }
 
 fn main() {
+    if let Some(err) = instance::required_isolation_error() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
     if std::env::args().any(|arg| arg == "--probe") {
         println!("{}", serde_json::to_string_pretty(&agg_core::assess_platform()).unwrap_or_default());
         return;
@@ -1009,7 +1028,7 @@ fn main() {
             auto_start_enabled, start_gateway, stop_gateway, codex_suspend, codex_resume, set_retain_on_exit, gateway_status, inspect_previous_gateway, clear_run_guard,
             get_autostart_gateway, set_autostart_gateway,
             oauth_start, oauth_action, discovered_models, verify_model_roundtrip, log_message,
-            codex_detect, codex_status, codex_preview, codex_apply, codex_rollback, sync_model_catalog, sync_chatgpt_auth
+            codex_detect, codex_status, codex_preview, codex_apply, codex_rollback, sync_model_catalog, preview_chatgpt_auth, confirm_chatgpt_auth
         ])
         .build(tauri::generate_context!()).expect("tauri setup");
     app.run(|app, event| {

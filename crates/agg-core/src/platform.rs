@@ -107,6 +107,19 @@ pub fn store_secret(dir: &Path, _account: &str, _material: &str) -> Result<(), S
     Err(secret_assessment())
 }
 
+pub const FILE_TOKEN_ACCEPTANCE_FLAG: &str = "--accept-file-tokens";
+
+/// `oauth-begin` must exit before any login when the caller has not accepted
+/// file-based token storage. CLIProxyAPI v8.0.57 has no keychain flag.
+pub fn refuse_oauth_begin_without_file_token_acceptance(accepted: bool) -> Result<(), String> {
+    if accepted {
+        return Ok(());
+    }
+    Err(format!(
+        "oauth-begin refused: CLIProxyAPI v8.0.57 registers NewFileTokenStore() and writes OAuth JSON under the gateway auth directory. There is no Keychain, Credential Manager, or Secret Service flag. Re-run with {FILE_TOKEN_ACCEPTANCE_FLAG} after reading that warning. No login was started and no token file was written."
+    ))
+}
+
 fn current_mechanism() -> String {
     match std::env::consts::OS {
         "macos" => "macos-keychain".into(),

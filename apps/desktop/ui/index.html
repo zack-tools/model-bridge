@@ -516,7 +516,7 @@
         <div class="metric-card">
           <div class="metric-label">ChatGPT 官方整合</div>
           <div class="metric-value" id="metric-desktop" style="color: #10b981;">Custom</div>
-          <div class="metric-hint" id="metric-desktop-hint">保持登入 • 雙向同步中</div>
+          <div class="metric-hint" id="metric-desktop-hint">閘道使用自己的 OAuth</div>
         </div>
         <div class="metric-card">
           <div class="metric-label">有效帳號數</div>
@@ -580,9 +580,9 @@
         <div class="quick-setup-box">
           <div class="quick-setup-text">
             <h3>🚀 一鍵設定 ChatGPT Desktop</h3>
-            <p>自動同步模型清單目錄 (model_catalog) + 套用 Custom 閘道端點 + 雙向同步登入憑證，一次搞定！</p>
+            <p>同步模型清單目錄 (model_catalog) 並套用 Custom 閘道端點。不會讀寫 Codex 的登入檔。</p>
           </div>
-          <button id="one-click-setup-btn" type="button" class="btn-highlight">⚡️ 一鍵套用與同步</button>
+          <button id="one-click-setup-btn" type="button" class="btn-highlight">⚡️ 一鍵套用閘道</button>
         </div>
 
         <div class="form-group">
@@ -610,7 +610,7 @@
 
         <!-- 獨立進階操作按鈕列 -->
         <div style="display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.85rem;">
-          <button id="codex-sync-auth-btn" type="button" class="btn-success">🔄 同步登入憑證 (保持登入)</button>
+          <button id="codex-sync-auth-btn" type="button" class="btn-success">🔍 預覽登入隔離</button>
           <button id="codex-sync-catalog-btn" type="button" style="background:#0284c7; color:#fff;">📋 同步模型目錄 (model_catalog)</button>
           <button id="codex-apply-btn" type="button" class="btn-primary">💾 套用至 config.toml</button>
           <button id="codex-preview-diff" type="button">🔍 預覽安全 Diff</button>

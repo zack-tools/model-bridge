@@ -3,7 +3,12 @@
 //! Operates on a caller-supplied path. Detection does not create directories
 //! and does not treat a desktop-client path as known. Apply preserves unrelated
 //! TOML, writes a sibling backup, and refuses foreign or externally edited files.
-//! It never opens `auth.json` for writing.
+//!
+//! Detect, preview, apply, rollback, catalog sync, gateway start, and the daemon
+//! follow-up never open `auth.json`. A person can preview that file and then
+//! confirm a separation step. That step never copies a refresh token. The gateway
+//! keeps the login it obtained itself. A generation-numbered backup is written
+//! first, and a backup failure leaves `auth.json` unchanged.
 
 use crate::redact::Redactor;
 use serde::{Deserialize, Serialize};
@@ -391,6 +396,18 @@ pub fn sync_model_catalog(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSyncPreview {
+    pub auth_json_path: PathBuf,
+    pub gateway_has_own_login: bool,
+    pub desktop_file_present: bool,
+    pub shared_refresh_token: bool,
+    pub refresh_token_will_be_copied: bool,
+    pub would_write: bool,
+    pub next_backup_name: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthSyncSummary {
     pub auth_json_path: PathBuf,
     pub backup_path: Option<PathBuf>,
@@ -400,302 +417,179 @@ pub struct AuthSyncSummary {
     pub account_id: Option<String>,
     pub plan_type: Option<String>,
     pub message: String,
+    pub refresh_token_copied: bool,
+    pub wrote: bool,
 }
 
-/// 安全同步 ChatGPT Desktop (auth.json) 與本機聚合閘道 (runtime/auth/codex-*.json) 的憑證。
-///
-/// 1. 當本機閘道有最新有效之憑證時，自動同步至 ~/.codex/auth.json 並設定 auth_mode 為 "chatgpt"，
-///    使 ChatGPT Desktop UI 保持登入態。
-/// 2. 當 ChatGPT Desktop 原生更新憑證時，亦能自動導入本地 runtime/auth，達成雙向憑證一致。
-/// 3. 所有磁碟寫入皆透過 atomic_write 保證 0600 本機私有權限，絕不上傳。
-pub fn sync_chatgpt_desktop_auth(
+/// Gateway start does no Codex auth I/O. Callers on the default path use this
+/// and must not open `auth.json` themselves.
+pub fn after_gateway_start(codex_home: &Path) -> Result<(), CodexError> {
+    let _ = codex_home;
+    Ok(())
+}
+
+/// Daemon follow-up may resume `config.toml`. It does not open `auth.json`.
+pub fn after_daemon_start(config_path: &Path, port: u16, gateway_key: &str) -> Result<bool, CodexError> {
+    resume_config(config_path, port, gateway_key)
+}
+
+/// Read-only preview of an explicit separation step. Does not create directories
+/// or backups and does not return token material.
+pub fn preview_chatgpt_desktop_auth(
     runtime_auth_dir: &Path,
     codex_home: &Path,
-) -> Result<AuthSyncSummary, CodexError> {
-    reject_symlink(codex_home)?;
+) -> Result<AuthSyncPreview, CodexError> {
     let auth_path = codex_home.join("auth.json");
+    reject_symlink(codex_home)?;
     reject_symlink(&auth_path)?;
-
-    if !codex_home.exists() {
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        let _ = builder.create(codex_home);
-    }
-
-    // 1. 掃描 runtime/auth 中的有效 Codex 憑證
-    #[derive(Debug, Clone)]
-    struct RuntimeCreds {
-        access_token: String,
-        refresh_token: String,
-        id_token: Option<String>,
-        account_id: Option<String>,
-        email: Option<String>,
-        plan_type: Option<String>,
-        last_refresh: Option<String>,
-        file_path: PathBuf,
-    }
-
-    let mut runtime_creds: Vec<RuntimeCreds> = Vec::new();
-    if runtime_auth_dir.exists() && runtime_auth_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(runtime_auth_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if name.starts_with("codex-")
-                    && name.ends_with(".json")
-                    && !name.ends_with(".lock")
-                    && !name.ends_with(".bak")
-                {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                            let disabled = val.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let acc_tok = val.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let ref_tok = val.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            if !disabled && !acc_tok.is_empty() && !ref_tok.is_empty() {
-                                runtime_creds.push(RuntimeCreds {
-                                    access_token: acc_tok,
-                                    refresh_token: ref_tok,
-                                    id_token: val.get("id_token").and_then(|v| v.as_str()).map(str::to_string),
-                                    account_id: val.get("account_id").and_then(|v| v.as_str()).map(str::to_string),
-                                    email: val.get("email").and_then(|v| v.as_str()).map(str::to_string),
-                                    plan_type: val.get("plan_type").and_then(|v| v.as_str()).map(str::to_string),
-                                    last_refresh: val.get("last_refresh").and_then(|v| v.as_str()).map(str::to_string),
-                                    file_path: path,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 依 last_refresh 由新到舊排序
-    runtime_creds.sort_by(|a, b| {
-        b.last_refresh.as_deref().unwrap_or("").cmp(a.last_refresh.as_deref().unwrap_or(""))
-    });
-
-    // 2. 讀取現有 ~/.codex/auth.json
-    let (mut desktop_val, auth_existed) = if auth_path.exists() {
-        let content = fs::read_to_string(&auth_path).map_err(|e| CodexError::Message(e.to_string()))?;
-        let v: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| CodexError::Message(format!("auth.json parse: {e}")))?;
-        (v, true)
+    let gateway_tokens = gateway_refresh_tokens(runtime_auth_dir)?;
+    let desktop = read_desktop_auth(&auth_path)?;
+    let desktop_refresh = desktop.as_ref().and_then(desktop_refresh_token);
+    let shared = desktop_refresh.as_deref().is_some_and(|token| gateway_tokens.iter().any(|item| item == token));
+    let generation = if shared { Some(next_backup_generation(codex_home)?) } else { None };
+    let message = if shared {
+        "預覽：桌面 auth.json 的 refresh token 與閘道自己的 OAuth 檔相同。確認後只會從桌面檔移除該 refresh token，不會把權杖複製到另一端。會先寫入世代編號備份；備份失敗則不改檔。".to_string()
+    } else if gateway_tokens.is_empty() && desktop_refresh.is_none() {
+        "預覽：閘道與桌面都沒有可分離的 refresh token。確認後不會寫入 auth.json。閘道登入只來自它自己的 OAuth。".to_string()
     } else {
-        (serde_json::json!({
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": null,
-            "tokens": {},
-            "last_refresh": ""
-        }), false)
+        "預覽：兩端沒有共用的 refresh token。確認後不會寫入 auth.json，也不會複製 refresh token。閘道使用自己的 OAuth 登入。".to_string()
     };
+    Ok(AuthSyncPreview {
+        auth_json_path: auth_path,
+        gateway_has_own_login: !gateway_tokens.is_empty(),
+        desktop_file_present: desktop.is_some(),
+        shared_refresh_token: shared,
+        refresh_token_will_be_copied: false,
+        would_write: shared,
+        next_backup_name: generation.map(|n| format!("auth.json.{n}.model-bridge.bak")),
+        message,
+    })
+}
 
-    let desktop_access_token = desktop_val
-        .get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let desktop_refresh_token = desktop_val
-        .get("tokens")
+/// Confirmed separation. Refuses to copy refresh tokens in either direction.
+/// When the desktop file contains the gateway's refresh token, that field is
+/// removed only after a new `auth.json.<generation>.model-bridge.bak` is durable.
+pub fn apply_chatgpt_desktop_auth(
+    runtime_auth_dir: &Path,
+    codex_home: &Path,
+    confirmed: bool,
+) -> Result<AuthSyncSummary, CodexError> {
+    let auth_path = codex_home.join("auth.json");
+    if !confirmed {
+        return Err(CodexError::Message("需要先預覽並確認，才會處理 auth.json".into()));
+    }
+    let preview = preview_chatgpt_desktop_auth(runtime_auth_dir, codex_home)?;
+    if !preview.would_write {
+        return Ok(summary(&auth_path, None, false, preview.message));
+    }
+    let original = fs::read(&auth_path).map_err(|e| CodexError::Message(format!("backup failed; auth.json unchanged: {e}")))?;
+    let backup = backup_auth_json(codex_home, &original)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&original)
+        .map_err(|e| CodexError::Message(format!("auth.json parse: {e}")))?;
+    if let Some(obj) = value.get_mut("tokens").and_then(|v| v.as_object_mut()) {
+        obj.remove("refresh_token");
+    }
+    let formatted = serde_json::to_string_pretty(&value).map_err(|e| CodexError::Message(e.to_string()))?;
+    atomic_write(&auth_path, formatted.as_bytes())?;
+    Ok(summary(
+        &auth_path,
+        Some(backup),
+        true,
+        "已從桌面 auth.json 移除與閘道相同的 refresh token。閘道仍使用自己的 OAuth 檔，沒有複製 refresh token。".into(),
+    ))
+}
+
+fn summary(auth_path: &Path, backup: Option<PathBuf>, wrote: bool, message: String) -> AuthSyncSummary {
+    AuthSyncSummary {
+        auth_json_path: auth_path.to_path_buf(),
+        backup_path: backup,
+        synced_to_desktop: false,
+        synced_from_desktop: false,
+        email: None,
+        account_id: None,
+        plan_type: None,
+        message,
+        refresh_token_copied: false,
+        wrote,
+    }
+}
+
+fn gateway_refresh_tokens(runtime_auth_dir: &Path) -> Result<Vec<String>, CodexError> {
+    let mut out = Vec::new();
+    if !runtime_auth_dir.exists() {
+        return Ok(out);
+    }
+    if !runtime_auth_dir.is_dir() {
+        return Err(CodexError::Message("runtime auth path is not a directory".into()));
+    }
+    let entries = fs::read_dir(runtime_auth_dir).map_err(|e| CodexError::Message(e.to_string()))?;
+    for entry in entries {
+        let path = entry.map_err(|e| CodexError::Message(e.to_string()))?.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !(name.starts_with("codex-") && name.ends_with(".json") && !name.ends_with(".lock") && !name.contains(".bak")) {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|e| CodexError::Message(e.to_string()))?;
+        let val: serde_json::Value = serde_json::from_str(&content).map_err(|e| CodexError::Message(e.to_string()))?;
+        if val.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(token) = val.get("refresh_token").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            out.push(token.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn read_desktop_auth(auth_path: &Path) -> Result<Option<serde_json::Value>, CodexError> {
+    if !auth_path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(auth_path).map_err(|e| CodexError::Message(e.to_string()))?;
+    let value = serde_json::from_str(&content).map_err(|e| CodexError::Message(format!("auth.json parse: {e}")))?;
+    Ok(Some(value))
+}
+
+fn desktop_refresh_token(value: &serde_json::Value) -> Option<String> {
+    value.get("tokens")
         .and_then(|t| t.get("refresh_token"))
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let desktop_last_refresh = desktop_val
-        .get("last_refresh")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
 
-    let has_valid_desktop = !desktop_access_token.is_empty() && !desktop_refresh_token.is_empty();
-    let desktop_account = desktop_val.get("tokens").and_then(|t| t.get("account_id"))
-        .and_then(|v| v.as_str()).filter(|id| !id.is_empty());
-    let best_runtime = if has_valid_desktop && !runtime_creds.is_empty() {
-        let matching: Vec<_> = runtime_creds.iter().filter(|rt| {
-            match (desktop_account, rt.account_id.as_deref().filter(|id| !id.is_empty())) {
-                (Some(desktop), Some(runtime)) => desktop == runtime,
-                _ => desktop_access_token == rt.access_token && desktop_refresh_token == rt.refresh_token,
-            }
-        }).collect();
-        if matching.len() != 1 {
-            return Err(CodexError::Message("無法唯一確認兩端為同一帳號；未同步憑證".into()));
+fn next_backup_generation(codex_home: &Path) -> Result<u64, CodexError> {
+    let mut generation = 1u64;
+    loop {
+        if generation > 10_000 {
+            return Err(CodexError::Message("too many auth.json backups".into()));
         }
-        matching.first().map(|rt| (*rt).clone())
-    } else {
-        if runtime_creds.len() > 1 {
-            return Err(CodexError::Message("閘道有多個帳號；未自動選擇憑證".into()));
+        if !codex_home.join(format!("auth.json.{generation}.model-bridge.bak")).exists() {
+            return Ok(generation);
         }
-        runtime_creds.first().cloned()
-    };
-
-    // 3. 雙向同步決策
-    if let Some(rt) = best_runtime {
-        let desktop_is_newer = has_valid_desktop && desktop_last_refresh.as_str() > rt.last_refresh.as_deref().unwrap_or("");
-        if desktop_is_newer {
-            // ChatGPT Desktop 擁有更新的 token -> 同步回 runtime 檔案
-            if let Ok(content) = fs::read_to_string(&rt.file_path) {
-                if let Ok(mut rt_val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    rt_val["access_token"] = serde_json::json!(desktop_access_token);
-                    rt_val["refresh_token"] = serde_json::json!(desktop_refresh_token);
-                    if let Some(id_tok) = desktop_val.get("tokens").and_then(|t| t.get("id_token")).and_then(|v| v.as_str()) {
-                        rt_val["id_token"] = serde_json::json!(id_tok);
-                    }
-                    if !desktop_last_refresh.is_empty() {
-                        rt_val["last_refresh"] = serde_json::json!(desktop_last_refresh);
-                    }
-                    let out = serde_json::to_string_pretty(&rt_val).map_err(|e| CodexError::Message(e.to_string()))?;
-                    atomic_write(&rt.file_path, out.as_bytes())?;
-                }
-            }
-            return Ok(AuthSyncSummary {
-                auth_json_path: auth_path,
-                backup_path: None,
-                synced_to_desktop: false,
-                synced_from_desktop: true,
-                email: rt.email,
-                account_id: rt.account_id,
-                plan_type: rt.plan_type,
-                message: "已自 ChatGPT Desktop 導入最新登入憑證至聚合閘道".into(),
-            });
-        }
-
-        // 兩端 token 相同且有效 -> 無須覆寫
-        if has_valid_desktop && desktop_access_token == rt.access_token && desktop_refresh_token == rt.refresh_token {
-            return Ok(AuthSyncSummary {
-                auth_json_path: auth_path,
-                backup_path: None,
-                synced_to_desktop: false,
-                synced_from_desktop: false,
-                email: rt.email,
-                account_id: rt.account_id,
-                plan_type: rt.plan_type,
-                message: "ChatGPT Desktop 憑證已與本機閘道保持最新同步（登入狀態良好）".into(),
-            });
-        }
-
-        // 本機閘道有最新憑證 -> 同步至 ~/.codex/auth.json
-        let backup_path = if auth_existed {
-            let bpath = codex_home.join("auth.json.model-bridge.bak");
-            let _ = fs::copy(&auth_path, &bpath);
-            Some(bpath)
-        } else {
-            None
-        };
-
-        desktop_val["auth_mode"] = serde_json::json!("chatgpt");
-        if desktop_val.get("OPENAI_API_KEY").is_none() {
-            desktop_val["OPENAI_API_KEY"] = serde_json::Value::Null;
-        }
-        if desktop_val.get("tokens").is_none() {
-            desktop_val["tokens"] = serde_json::json!({});
-        }
-        if let Some(obj) = desktop_val.get_mut("tokens").and_then(|v| v.as_object_mut()) {
-            obj.insert("access_token".into(), serde_json::json!(rt.access_token));
-            obj.insert("refresh_token".into(), serde_json::json!(rt.refresh_token));
-            if let Some(it) = &rt.id_token {
-                obj.insert("id_token".into(), serde_json::json!(it));
-            }
-            if let Some(aid) = &rt.account_id {
-                obj.insert("account_id".into(), serde_json::json!(aid));
-            }
-        }
-        if let Some(lr) = &rt.last_refresh {
-            desktop_val["last_refresh"] = serde_json::json!(lr);
-        }
-
-        let formatted = serde_json::to_string_pretty(&desktop_val).map_err(|e| CodexError::Message(e.to_string()))?;
-        atomic_write(&auth_path, formatted.as_bytes())?;
-
-        Ok(AuthSyncSummary {
-            auth_json_path: auth_path,
-            backup_path,
-            synced_to_desktop: true,
-            synced_from_desktop: false,
-            email: rt.email.clone(),
-            account_id: rt.account_id.clone(),
-            plan_type: rt.plan_type.clone(),
-            message: format!("已成功將本機有效憑證同步至 ChatGPT Desktop (帳號: {})", rt.email.as_deref().unwrap_or("已驗證")),
-        })
-    } else if has_valid_desktop {
-        // 本機 runtime 尚無憑證，但 ChatGPT Desktop 原生有有效 token -> 導出至 runtime
-        if !runtime_auth_dir.exists() {
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            let _ = builder.create(runtime_auth_dir);
-        }
-        let acc_id = desktop_val.get("tokens")
-            .and_then(|t| t.get("account_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("default");
-        let id_tok = desktop_val.get("tokens")
-            .and_then(|t| t.get("id_token"))
-            .and_then(|v| v.as_str());
-
-        let (email, plan_type) = if let Some(jwt) = id_tok {
-            let payload = decode_jwt_payload(jwt);
-            let email = payload.as_ref().and_then(|p| p.get("email")).and_then(|v| v.as_str()).map(str::to_string);
-            let plan = payload.as_ref()
-                .and_then(|p| p.get("https://api.openai.com/auth"))
-                .and_then(|a| a.get("chatgpt_plan_type"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            (email, plan)
-        } else {
-            (None, None)
-        };
-
-        let short_id = if acc_id.len() >= 8 { &acc_id[..8] } else { acc_id };
-        let email_slug = email.as_deref().unwrap_or("desktop-user");
-        let plan_slug = plan_type.as_deref().unwrap_or("plus");
-        let target_name = format!("codex-{short_id}-{email_slug}-{plan_slug}.json");
-        let target_path = runtime_auth_dir.join(target_name);
-
-        let runtime_entry = serde_json::json!({
-            "access_token": desktop_access_token,
-            "refresh_token": desktop_refresh_token,
-            "id_token": id_tok,
-            "account_id": acc_id,
-            "email": email,
-            "plan_type": plan_type,
-            "disabled": false,
-            "last_refresh": desktop_last_refresh,
-            "type": "codex"
-        });
-
-        let formatted = serde_json::to_string_pretty(&runtime_entry).map_err(|e| CodexError::Message(e.to_string()))?;
-        atomic_write(&target_path, formatted.as_bytes())?;
-
-        Ok(AuthSyncSummary {
-            auth_json_path: auth_path,
-            backup_path: None,
-            synced_to_desktop: false,
-            synced_from_desktop: true,
-            email,
-            account_id: Some(acc_id.to_string()),
-            plan_type,
-            message: "已自 ChatGPT Desktop 匯入登入憑證至本地聚合閘道".into(),
-        })
-    } else {
-        Ok(AuthSyncSummary {
-            auth_json_path: auth_path,
-            backup_path: None,
-            synced_to_desktop: false,
-            synced_from_desktop: false,
-            email: None,
-            account_id: None,
-            plan_type: None,
-            message: "未在閘道或 ChatGPT Desktop 中發現有效之本機登入憑證".into(),
-        })
+        generation += 1;
     }
+}
+
+fn backup_auth_json(codex_home: &Path, original: &[u8]) -> Result<PathBuf, CodexError> {
+    let generation = next_backup_generation(codex_home)?;
+    let backup = codex_home.join(format!("auth.json.{generation}.model-bridge.bak"));
+    reject_symlink(&backup)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&backup).map_err(|e| {
+        CodexError::Message(format!("backup failed; auth.json unchanged: {e}"))
+    })?;
+    if let Err(err) = file.write_all(original).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&backup);
+        return Err(CodexError::Message(format!("backup failed; auth.json unchanged: {err}")));
+    }
+    Ok(backup)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1195,51 +1089,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CodexError> {
     Ok(())
 }
 
-fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
-    let parts: Vec<&str> = jwt.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let payload_b64 = parts[1];
-    let mut s = payload_b64.replace('-', "+").replace('_', "/");
-    match s.len() % 4 {
-        2 => s.push_str("=="),
-        3 => s.push_str("="),
-        _ => {}
-    }
-    let bytes = base64_decode_raw(&s).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn base64_decode_raw(input: &str) -> Result<Vec<u8>, ()> {
-    const TABLE: [i8; 256] = {
-        let mut t = [-1i8; 256];
-        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i < chars.len() {
-            t[chars[i] as usize] = i as i8;
-            i += 1;
-        }
-        t
-    };
-    let mut buf = Vec::new();
-    let mut accum = 0u32;
-    let mut bits = 0;
-    for &b in input.as_bytes() {
-        if b == b'=' || b.is_ascii_whitespace() { continue; }
-        let val = TABLE[b as usize];
-        if val < 0 { return Err(()); }
-        accum = (accum << 6) | (val as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            buf.push((accum >> bits) as u8);
-            accum &= (1 << bits) - 1;
-        }
-    }
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1597,86 +1446,179 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn write_gateway_login(runtime: &Path, refresh: &str) -> PathBuf {
+        fs::create_dir_all(runtime).unwrap();
+        let path = runtime.join("codex-own-login.json");
+        let body = serde_json::json!({
+            "access_token": "gateway-access",
+            "refresh_token": refresh,
+            "account_id": "gateway-account",
+            "disabled": false,
+            "type": "codex"
+        });
+        fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        path
+    }
+
     #[test]
-    fn auth_sync_rejects_different_accounts_without_writing() {
+    fn explicit_auth_separation_never_copies_refresh_tokens() {
         let dir = scratch();
         let runtime = dir.join("runtime/auth");
         let home = dir.join("home");
-        fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(&home).unwrap();
-        let runtime_file = runtime.join("codex-test.json");
-        let original_runtime = r#"{"access_token":"rt-access","refresh_token":"rt-refresh","account_id":"account-b","last_refresh":"2026-01-01"}"#;
-        let original_desktop = r#"{"tokens":{"access_token":"desk-access","refresh_token":"desk-refresh","account_id":"account-a"},"last_refresh":"2026-02-01"}"#;
-        fs::write(&runtime_file, original_runtime).unwrap();
-        fs::write(home.join("auth.json"), original_desktop).unwrap();
-        assert!(sync_chatgpt_desktop_auth(&runtime, &home).is_err());
-        assert_eq!(fs::read_to_string(runtime_file).unwrap(), original_runtime);
-        assert_eq!(fs::read_to_string(home.join("auth.json")).unwrap(), original_desktop);
+        let runtime_file = write_gateway_login(&runtime, "gateway-refresh");
+        let original_runtime = fs::read_to_string(&runtime_file).unwrap();
+        let desktop = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"desk-access","refresh_token":"desk-refresh","account_id":"account-a"},"last_refresh":"2026-02-01"}"#;
+        let auth_path = home.join("auth.json");
+        fs::write(&auth_path, desktop).unwrap();
+
+        let preview = preview_chatgpt_desktop_auth(&runtime, &home).unwrap();
+        assert!(!preview.refresh_token_will_be_copied);
+        assert!(!preview.would_write);
+        assert!(!preview.shared_refresh_token);
+        assert!(!preview.message.contains("gateway-refresh"));
+        assert!(!preview.message.contains("desk-refresh"));
+        assert!(apply_chatgpt_desktop_auth(&runtime, &home, false).is_err());
+        assert_eq!(fs::read_to_string(&auth_path).unwrap(), desktop);
+        let confirmed = apply_chatgpt_desktop_auth(&runtime, &home, true).unwrap();
+        assert!(!confirmed.wrote);
+        assert!(!confirmed.refresh_token_copied);
+        assert!(!confirmed.synced_to_desktop);
+        assert!(!confirmed.synced_from_desktop);
+        assert_eq!(fs::read_to_string(&auth_path).unwrap(), desktop);
+        assert_eq!(fs::read_to_string(&runtime_file).unwrap(), original_runtime);
+        assert!(fs::read_dir(&home).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().contains(".model-bridge.bak")
+        }));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn sync_chatgpt_desktop_auth_both_directions() {
+    fn confirmed_separation_strips_only_a_shared_refresh_token_after_numbered_backup() {
         let dir = scratch();
-        let runtime_auth = dir.join("runtime").join("auth");
-        let codex_home = dir.join("codex_home");
-        fs::create_dir_all(&runtime_auth).unwrap();
-        fs::create_dir_all(&codex_home).unwrap();
+        let runtime = dir.join("runtime/auth");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let runtime_file = write_gateway_login(&runtime, "shared-refresh");
+        let original_runtime = fs::read_to_string(&runtime_file).unwrap();
+        let desktop = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"desk-access","refresh_token":"shared-refresh","account_id":"account-a"}}"#;
+        let auth_path = home.join("auth.json");
+        fs::write(&auth_path, desktop).unwrap();
 
-        // 1. Initial state: Runtime has fresh OAuth token, Desktop auth.json is empty or missing
-        let rt_file = runtime_auth.join("codex-3d4a40d6-test@example.com-plus.json");
-        let rt_json = serde_json::json!({
-            "access_token": "acc_token_12345",
-            "refresh_token": "ref_token_67890",
-            "id_token": "id_token_abcde",
-            "account_id": "acc-id-9999",
-            "email": "test@example.com",
-            "plan_type": "plus",
-            "disabled": false,
-            "last_refresh": "2026-11-07T18:00:00+08:00",
-            "type": "codex"
+        let preview = preview_chatgpt_desktop_auth(&runtime, &home).unwrap();
+        assert!(preview.would_write);
+        assert_eq!(preview.next_backup_name.as_deref(), Some("auth.json.1.model-bridge.bak"));
+        assert!(!preview.refresh_token_will_be_copied);
+        assert!(!preview.message.contains("shared-refresh"));
+
+        let summary = apply_chatgpt_desktop_auth(&runtime, &home, true).unwrap();
+        assert!(summary.wrote);
+        assert!(!summary.refresh_token_copied);
+        let backup = home.join("auth.json.1.model-bridge.bak");
+        assert_eq!(summary.backup_path.as_deref(), Some(backup.as_path()));
+        assert_eq!(fs::read_to_string(&backup).unwrap(), desktop);
+        let updated: serde_json::Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert!(updated["tokens"].get("refresh_token").is_none());
+        assert_eq!(updated["tokens"]["access_token"], "desk-access");
+        assert_eq!(fs::read_to_string(&runtime_file).unwrap(), original_runtime);
+
+        fs::write(&auth_path, desktop).unwrap();
+        let again = apply_chatgpt_desktop_auth(&runtime, &home, true).unwrap();
+        assert!(again.wrote);
+        assert!(home.join("auth.json.2.model-bridge.bak").is_file());
+        assert!(home.join("auth.json.1.model-bridge.bak").is_file());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_failure_aborts_the_auth_json_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let runtime = dir.join("runtime/auth");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        write_gateway_login(&runtime, "shared-refresh");
+        let desktop = r#"{"tokens":{"access_token":"desk-access","refresh_token":"shared-refresh"}}"#;
+        let auth_path = home.join("auth.json");
+        fs::write(&auth_path, desktop).unwrap();
+        let mut perms = fs::metadata(&home).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&home, perms).unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let mut perms = fs::metadata(&self.0).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&self.0, perms).unwrap();
+            }
+        }
+        let _restore = Restore(home.clone());
+        let err = apply_chatgpt_desktop_auth(&runtime, &home, true).unwrap_err();
+        assert!(err.to_string().contains("backup failed"));
+        assert_eq!(fs::read_to_string(&auth_path).unwrap(), desktop);
+        drop(_restore);
+        assert!(!home.join("auth.json.1.model-bridge.bak").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_followups_do_not_open_auth_json() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = scratch();
+        let auth = dir.join("auth.json");
+        assert!(std::process::Command::new("mkfifo").arg(&auth).status().unwrap().success());
+        fs::write(dir.join("config.toml"), "personality = \"keep\"\n").unwrap();
+        let req = req(&dir, None);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(apply_config(&req));
         });
-        fs::write(&rt_file, serde_json::to_string(&rt_json).unwrap()).unwrap();
+        let applied = rx.recv_timeout(Duration::from_secs(2)).expect("apply_config opened auth.json");
+        applied.unwrap();
+        assert!(fs::symlink_metadata(&auth).unwrap().file_type().is_fifo());
 
-        // Perform sync -> should populate auth.json
-        let summary1 = sync_chatgpt_desktop_auth(&runtime_auth, &codex_home).unwrap();
-        assert!(summary1.synced_to_desktop);
-        assert!(!summary1.synced_from_desktop);
-        assert_eq!(summary1.email.as_deref(), Some("test@example.com"));
+        let (tx, rx) = mpsc::channel();
+        let home = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(after_gateway_start(&home));
+        });
+        rx.recv_timeout(Duration::from_secs(2)).expect("after_gateway_start opened auth.json").unwrap();
 
-        let auth_json_path = codex_home.join("auth.json");
-        assert!(auth_json_path.exists());
-        let desktop_content = fs::read_to_string(&auth_json_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&desktop_content).unwrap();
-        assert_eq!(parsed["auth_mode"], "chatgpt");
-        assert_eq!(parsed["tokens"]["access_token"], "acc_token_12345");
-        assert_eq!(parsed["tokens"]["refresh_token"], "ref_token_67890");
-        assert_eq!(parsed["tokens"]["account_id"], "acc-id-9999");
-        assert_eq!(parsed["last_refresh"], "2026-11-07T18:00:00+08:00");
+        let config = dir.join("config.toml");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(after_daemon_start(&config, 50833, "localgateway012345"));
+        });
+        rx.recv_timeout(Duration::from_secs(2)).expect("after_daemon_start opened auth.json").unwrap();
+        assert!(fs::symlink_metadata(&auth).unwrap().file_type().is_fifo());
 
-        // 2. Already synced -> should be noop
-        let summary2 = sync_chatgpt_desktop_auth(&runtime_auth, &codex_home).unwrap();
-        assert!(!summary2.synced_to_desktop);
-        assert!(!summary2.synced_from_desktop);
-        assert!(summary2.message.contains("最新同步"));
+        let runtime = dir.join("runtime");
+        let (tx, rx) = mpsc::channel();
+        let home = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(apply_chatgpt_desktop_auth(&runtime, &home, false));
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(2)).expect("unconfirmed auth apply opened auth.json").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
 
-        // 3. Desktop has newer token (e.g. user refreshed in ChatGPT Desktop)
-        let mut updated_desktop = parsed.clone();
-        updated_desktop["tokens"]["access_token"] = serde_json::json!("acc_token_desktop_newer");
-        updated_desktop["tokens"]["refresh_token"] = serde_json::json!("ref_token_desktop_newer");
-        updated_desktop["last_refresh"] = serde_json::json!("2026-11-07T19:00:00+08:00");
-        fs::write(&auth_json_path, serde_json::to_string(&updated_desktop).unwrap()).unwrap();
-
-        let summary3 = sync_chatgpt_desktop_auth(&runtime_auth, &codex_home).unwrap();
-        assert!(summary3.synced_from_desktop);
-        assert!(!summary3.synced_to_desktop);
-
-        let rt_content_after = fs::read_to_string(&rt_file).unwrap();
-        let rt_parsed: serde_json::Value = serde_json::from_str(&rt_content_after).unwrap();
-        assert_eq!(rt_parsed["access_token"], "acc_token_desktop_newer");
-        assert_eq!(rt_parsed["refresh_token"], "ref_token_desktop_newer");
-        assert_eq!(rt_parsed["last_refresh"], "2026-11-07T19:00:00+08:00");
-
-        let _ = fs::remove_dir_all(&dir);
+    #[test]
+    fn missing_desktop_auth_file_is_not_created() {
+        let dir = scratch();
+        let runtime = dir.join("runtime/auth");
+        let home = dir.join("missing-home");
+        write_gateway_login(&runtime, "gateway-refresh");
+        let preview = preview_chatgpt_desktop_auth(&runtime, &home).unwrap();
+        assert!(!preview.desktop_file_present);
+        assert!(!preview.would_write);
+        assert!(!home.exists());
+        let summary = apply_chatgpt_desktop_auth(&runtime, &home, true).unwrap();
+        assert!(!summary.wrote);
+        assert!(!home.join("auth.json").exists());
+        let _ = fs::remove_dir_all(dir);
     }
 }

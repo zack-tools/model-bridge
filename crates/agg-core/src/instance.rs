@@ -56,6 +56,103 @@ pub fn desktop_guard_runtime(path: &Path, expected: &Path) -> Result<PathBuf, St
     Ok(runtime)
 }
 
+/// Data directory for this process. `APP_AGG_DATA_DIR` wins so a handoff can
+/// keep runtime files inside the working copy.
+pub fn app_data_dir() -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("APP_AGG_DATA_DIR") {
+        if value.is_empty() {
+            return Err("APP_AGG_DATA_DIR is empty".into());
+        }
+        return Ok(PathBuf::from(value));
+    }
+    default_app_data_dir()
+}
+
+pub fn core_binary_name() -> &'static str {
+    if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" }
+}
+
+pub fn archive_beside(binary: &Path) -> Result<PathBuf, String> {
+    let dir = binary.parent().ok_or("core binary has no parent directory")?;
+    Ok(dir.join(crate::pin::native_archive_name()?))
+}
+
+/// Paths the macOS handoff must keep inside the working copy.
+#[derive(Clone, Copy)]
+pub struct IsolationPaths<'a> {
+    pub root: &'a Path,
+    pub home: &'a Path,
+    pub codex_home: &'a Path,
+    pub data_dir: &'a Path,
+    pub core_dir: &'a Path,
+    pub real_home: &'a Path,
+}
+
+pub fn isolation_violation(paths: IsolationPaths<'_>) -> Option<String> {
+    if paths.real_home.as_os_str().is_empty() || paths.root.as_os_str().is_empty() {
+        return Some("isolation is not in effect: real home or handoff root is empty".into());
+    }
+    let forbidden = [
+        paths.real_home.join(".codex"),
+        paths.real_home.join(".cli-proxy-api"),
+        paths.real_home.join("Library/Application Support/io.github.zacktools.modelbridge"),
+    ];
+    let labeled = [
+        ("HOME", paths.home),
+        ("CODEX_HOME", paths.codex_home),
+        ("APP_AGG_DATA_DIR", paths.data_dir),
+        ("APP_AGG_CORE_DIR", paths.core_dir),
+    ];
+    for (name, path) in labeled {
+        if path.as_os_str().is_empty() {
+            return Some(format!("isolation is not in effect: {name} is empty"));
+        }
+        if path.components().any(|component| matches!(component, std::path::Component::ParentDir)) && !path.exists() {
+            return Some(format!("isolation is not in effect: {name} contains '..'"));
+        }
+        if !is_within(paths.root, path) {
+            return Some(format!("isolation is not in effect: {name} is outside the handoff root"));
+        }
+        for bad in &forbidden {
+            if path == bad || path.starts_with(bad) {
+                return Some(format!("isolation is not in effect: {name} points at a real user path"));
+            }
+        }
+    }
+    if paths.home == paths.real_home {
+        return Some("isolation is not in effect: HOME is the real home".into());
+    }
+    let real_codex = paths.real_home.join(".codex");
+    if paths.codex_home == real_codex {
+        return Some("isolation is not in effect: CODEX_HOME is the real ~/.codex".into());
+    }
+    None
+}
+
+/// When `APP_AGG_REQUIRE_ISOLATION=1`, refuse to continue unless every
+/// handoff path is inside `APP_AGG_HANDOFF_ROOT` and away from the real home.
+pub fn required_isolation_error() -> Option<String> {
+    if std::env::var("APP_AGG_REQUIRE_ISOLATION").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let read = |key: &str| -> Result<PathBuf, String> {
+        std::env::var(key).map(PathBuf::from).map_err(|_| format!("isolation is not in effect: {key} is unset"))
+    };
+    let root = match read("APP_AGG_HANDOFF_ROOT") { Ok(path) => path, Err(err) => return Some(err) };
+    let home = match read("HOME") { Ok(path) => path, Err(err) => return Some(err) };
+    let codex_home = match read("CODEX_HOME") { Ok(path) => path, Err(err) => return Some(err) };
+    let data_dir = match read("APP_AGG_DATA_DIR") { Ok(path) => path, Err(err) => return Some(err) };
+    let core_dir = match read("APP_AGG_CORE_DIR") { Ok(path) => path, Err(err) => return Some(err) };
+    let real_home = match read("APP_AGG_REAL_HOME") { Ok(path) => path, Err(err) => return Some(err) };
+    isolation_violation(IsolationPaths { root: &root, home: &home, codex_home: &codex_home, data_dir: &data_dir, core_dir: &core_dir, real_home: &real_home })
+}
+
+fn is_within(root: &Path, path: &Path) -> bool {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.starts_with(&root)
+}
+
 /// 預設應用程式資料目錄（跨平台相容）
 pub fn default_app_data_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
@@ -104,21 +201,19 @@ pub fn ensure_local_keys(dir: &Path) -> Result<(String, String), String> {
     Ok((gateway_key, management_key))
 }
 
-/// 尋找已釘選之 sidecar 核心二進位檔案
+/// 尋找已釘選之 sidecar 核心二進位檔案。
+/// 只看 `APP_AGG_CORE_DIR`，其次是應用資料目錄下的 `core`。
 pub fn find_core_binary() -> Result<PathBuf, String> {
+    let name = core_binary_name();
     if let Some(core_dir) = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from) {
-        let binary = core_dir.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" });
-        if binary.exists() {
+        let binary = core_dir.join(name);
+        if binary.is_file() {
             return Ok(binary);
         }
     }
-    let candidates = [
-        PathBuf::from("/Users/Zack/Documents/Codex/2026-11-06/model-bridge/.cache/cliproxyapi"),
-        default_app_data_dir().unwrap_or_default().join("core"),
-    ];
-    for dir in &candidates {
-        let binary = dir.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" });
-        if binary.exists() {
+    if let Ok(dir) = app_data_dir() {
+        let binary = dir.join("core").join(name);
+        if binary.is_file() {
             return Ok(binary);
         }
     }

@@ -42,6 +42,45 @@ fn legacy_and_malformed_guards_stay_untrusted() {
 }
 
 #[test]
+fn core_lookup_has_no_hardcoded_developer_path() {
+    let src = include_str!("../src/instance.rs");
+    assert!(!src.contains("/Users/Zack"));
+    assert!(!src.contains("Documents/Codex"));
+}
+
+#[test]
+fn isolation_accepts_only_paths_inside_the_handoff_root() {
+    use agg_core::instance::{isolation_violation, IsolationPaths};
+    let root = std::env::temp_dir().join(format!("agg-iso-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    let real = root.join("real");
+    let handoff = root.join("handoff");
+    for name in ["home", "codex-home", "app-data", "core"] {
+        std::fs::create_dir_all(handoff.join(name)).unwrap();
+    }
+    std::fs::create_dir_all(real.join(".codex")).unwrap();
+    std::fs::create_dir_all(real.join(".cli-proxy-api")).unwrap();
+    let home = handoff.join("home");
+    let codex_home = handoff.join("codex-home");
+    let data_dir = handoff.join("app-data");
+    let core_dir = handoff.join("core");
+    let real_codex = real.join(".codex");
+    let ok = IsolationPaths {
+        root: &handoff,
+        home: &home,
+        codex_home: &codex_home,
+        data_dir: &data_dir,
+        core_dir: &core_dir,
+        real_home: &real,
+    };
+    assert!(isolation_violation(ok).is_none());
+    let outside = IsolationPaths { codex_home: &real_codex, ..ok };
+    assert!(isolation_violation(outside).unwrap().contains("CODEX_HOME"));
+    let real_home_used = IsolationPaths { home: &real, ..ok };
+    assert!(isolation_violation(real_home_used).unwrap().contains("HOME"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn desktop_guard_accepts_only_the_expected_runtime() {
     let dir = std::env::temp_dir().join(format!("agg-desktop-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir_all(&dir).unwrap();
