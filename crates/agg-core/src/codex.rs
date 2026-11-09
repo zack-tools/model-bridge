@@ -1325,10 +1325,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir2);
     }
 
+    fn toml_basic_string(value: &str) -> String {
+        let mut out = String::from("\"");
+        for ch in value.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
     fn append_project_trust(path: &Path, project: &str) {
         let mut text = fs::read_to_string(path).unwrap();
-        text.push_str(&format!("\n[projects.\"{project}\"]\ntrust_level = \"trusted\"\n"));
+        let key = toml_basic_string(project);
+        text.push_str(&format!("\n[projects.{key}]\ntrust_level = \"trusted\"\n"));
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn project_trust_toml_escapes_windows_backslashes() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        fs::write(&path, "personality = \"keep\"\n").unwrap();
+        let project = "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\x";
+        append_project_trust(&path, project);
+        let doc = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        assert_eq!(project_trust(&doc, project), Some("trusted"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn project_trust<'a>(doc: &'a DocumentMut, project: &str) -> Option<&'a str> {
