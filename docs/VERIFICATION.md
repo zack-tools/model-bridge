@@ -1,11 +1,11 @@
-# 驗證紀錄
+﻿# 驗證紀錄
 
 最後更新：2026-11-07（Asia/Taipei）
 
 ## macOS 原生驗收紀錄（2026-11-07）
 
 - **作業系統與硬體**：macOS 27.2（26B123）、Apple Silicon（ARM64）。
-- **Rust 工具鏈**：`cargo 1.99.1`（位於 `$HOME/.local/share/app-agg-001/cargo`）。
+- **Rust 工具鏈**：`cargo 1.99.1`（位於 `$HOME/.local/share/model-bridge/cargo`）。
 - **核心二進位**：CLIProxyAPI v8.0.57 (`c2f402b45643f0740d70b9010fd7d8d0aab7ef65`)，釘選 darwin/aarch64 SHA-256 完整核對通過。
 - **測試結果**：
   - `agg-core` 單元測試：**42 passed, 0 failed, 1 ignored** (Windows x64 壓縮檔)。

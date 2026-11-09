@@ -1,4 +1,4 @@
-//! Private PoC desktop shell. The gateway runs only on explicit user request.
+﻿//! Private PoC desktop shell. The gateway runs only on explicit user request.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use agg_core::{attribution, instance, pin, registry::SourceKind, oauth::{AuthState, FailureClass, Provider}, oauth_client::OAuthClient, supervisor::{ProcessHealth, StartRequest, Supervisor}};
@@ -100,7 +100,7 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
         std::fs::create_dir_all(&lock_dir).map_err(|_| "無法建立鎖定目錄")?;
         let instance_lock = instance::acquire(&lock_dir.join("gateway.lock"))
             .map_err(|_| "另一個視窗已啟動閘道，或無法取得鎖定".to_string())?;
-        let core_dir = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from)
+        let core_dir = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from).or_else(|| std::env::current_exe().ok().and_then(|p| { let mut d = p.parent()?.to_path_buf(); for _ in 0..6 { let c = d.join(".cache").join("cliproxyapi"); if c.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" }).exists() { return Some(c); } d = d.parent()?.to_path_buf(); } None }))
             .ok_or("請先設定 APP_AGG_CORE_DIR，指向已下載的核心資料夾")?;
         let archive_name = match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => "CLIProxyAPI_8.0.57_darwin_aarch64.tar.gz",
@@ -190,8 +190,42 @@ async fn stop_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Result
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut gw = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
-        gw.stop()?;
+        if gw.process.is_some() {
+            gw.stop()?;
+        } else {
+            // 終止背景自啟或孤立的核心程序
+            let pid_file = lock_dir.join("gateway.pid");
+            if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_text.trim().parse::<u32>() {
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        let kill_cmd = format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue");
+                        let _ = std::process::Command::new("powershell")
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .args(["-NoProfile", "-Command", &kill_cmd])
+                            .output();
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(lock_dir.join("gateway.running"));
+        }
         let _ = std::fs::remove_file(lock_dir.join("gateway.pid"));
+
+        // 停止閘道時自動還原原生設定與原生模型目錄
+        if let Ok(config_path) = codex_config_path(None) {
+            let _ = agg_core::codex::suspend_config(&config_path);
+            if let Some(parent) = config_path.parent() {
+                let cat_path = parent.join("model_catalog.json");
+                let _ = agg_core::codex::restore_native_catalog(&cat_path);
+            }
+        }
+
         Ok(())
     }).await.map_err(|_| "停止工作失敗".to_string())?
 }
@@ -207,31 +241,129 @@ async fn set_retain_on_exit(state: State<'_, Shared>, retain: bool) -> Result<()
 }
 
 #[tauri::command]
+async fn get_autostart_gateway() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let output = std::process::Command::new("reg")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "ModelBridgeGateway"])
+                .output()
+                .map_err(|e| format!("查詢開機自啟設定失敗：{e}"))?;
+            Ok(output.status.success())
+        }
+        #[cfg(not(windows))]
+        Ok(false)
+    }).await.map_err(|_| "查詢開機自啟設定失敗".to_string())?
+}
+
+#[tauri::command]
+async fn set_autostart_gateway(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            if enabled {
+                let exe = std::env::current_exe().map_err(|e| format!("無法取得執行檔路徑：{e}"))?;
+                let exe_str = exe.to_str().ok_or("執行檔路徑無效")?;
+                let cmd_val = format!("\"{}\" --daemon", exe_str);
+                let output = std::process::Command::new("reg")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .args(["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "ModelBridgeGateway", "/t", "REG_SZ", "/d", &cmd_val, "/f"])
+                    .output()
+                    .map_err(|e| format!("寫入開機自啟設定失敗：{e}"))?;
+                if !output.status.success() {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("註冊自啟失敗：{err}"));
+                }
+                Ok(true)
+            } else {
+                let _ = std::process::Command::new("reg")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .args(["delete", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "ModelBridgeGateway", "/f"])
+                    .output();
+                Ok(false)
+            }
+        }
+        #[cfg(not(windows))]
+        Ok(false)
+    }).await.map_err(|_| "設定開機自啟失敗".to_string())?
+}
+
+#[tauri::command]
 async fn gateway_status(app: tauri::AppHandle, state: State<'_, Shared>) -> Result<serde_json::Value, String> {
-    let guard_path = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?.join("gateway.running");
+    let dir = app.path().app_data_dir().map_err(|_| "無法取得應用程式資料目錄".to_string())?;
+    let guard_path = dir.join("gateway.running");
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut gateway = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
         if gateway.process.is_none() && gateway.run_guard.is_some() {
             return Ok(serde_json::json!({"state": "cleanup_pending"}));
         }
-        let Some(process) = gateway.process.as_mut() else {
-            let state = match std::fs::symlink_metadata(&guard_path) {
-                Ok(_) => "needs_recovery",
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => "stopped",
-                Err(_) => return Err("無法檢查上次啟動紀錄".into()),
+        if let Some(process) = gateway.process.as_mut() {
+            let port = process.port;
+            return match process.health().map_err(|_| "無法檢查閘道狀態".to_string())? {
+                ProcessHealth::Healthy => Ok(serde_json::json!({"state": "healthy", "port": port})),
+                ProcessHealth::Degraded => Ok(serde_json::json!({"state": "degraded", "port": port})),
+                ProcessHealth::Exited => {
+                    gateway.stop()?;
+                    Ok(serde_json::json!({"state": "exited"}))
+                }
             };
-            return Ok(serde_json::json!({"state": state}));
-        };
-        let port = process.port;
-        match process.health().map_err(|_| "無法檢查閘道狀態".to_string())? {
-            ProcessHealth::Healthy => Ok(serde_json::json!({"state": "healthy", "port": port})),
-            ProcessHealth::Degraded => Ok(serde_json::json!({"state": "degraded", "port": port})),
-            ProcessHealth::Exited => {
-                gateway.stop()?;
-                Ok(serde_json::json!({"state": "exited"}))
-            }
         }
+
+        // 若記憶體無 Supervisor 控制柄，檢查是否已有在背景運作中的核心（例如開機自啟模式）
+        if guard_path.exists() {
+            let pid_file = dir.join("gateway.pid");
+            let running_pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+
+            let is_alive = if let Some(pid) = running_pid {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x08000000;
+                    let check_cmd = format!("Get-Process -Id {pid} -ErrorAction SilentlyContinue | Where-Object {{ $_.ProcessName -like '*cli-proxy-api*' }} | Select-Object -ExpandProperty Id");
+                    std::process::Command::new("powershell")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .args(["-NoProfile", "-Command", &check_cmd])
+                        .output()
+                        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+                        .unwrap_or(false)
+                }
+                #[cfg(not(windows))]
+                {
+                    std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().map(|s| s.success()).unwrap_or(false)
+                }
+            } else {
+                false
+            };
+
+            if is_alive {
+                let config_file = dir.join("runtime").join("config.yaml");
+                let port = std::fs::read_to_string(&config_file).ok().and_then(|content| {
+                    for line in content.lines() {
+                        let l = line.trim();
+                        if l.starts_with("port:") {
+                            return l.split(':').nth(1)?.trim().parse::<u16>().ok();
+                        }
+                    }
+                    None
+                }).unwrap_or(50833);
+
+                // 若該埠號確實正在被監聽，表示核心健康運行中！
+                if agg_core::supervisor::ensure_port_free(port).is_err() {
+                    return Ok(serde_json::json!({"state": "healthy", "port": port}));
+                }
+            }
+            return Ok(serde_json::json!({"state": "needs_recovery"}));
+        }
+
+        Ok(serde_json::json!({"state": "stopped"}))
     }).await.map_err(|_| "狀態檢查失敗".to_string())?
 }
 
@@ -451,7 +583,26 @@ async fn inspect_previous_gateway(app: tauri::AppHandle) -> Result<String, Strin
             let observation = if found { "發現命令列包含此目錄的核心程序。" } else { "未在程序命令列中找到此目錄；這不能證明舊程序已停止。" };
             return Ok(format!("{observation} 執行目錄：{}。保護仍保留，請勿直接刪除。", runtime.display()));
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let config = runtime.join("config.yaml");
+            let config = config.to_str().ok_or("路徑無法顯示")?;
+            let output = std::process::Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*cli-proxy-api*' } | ForEach-Object { $_.CommandLine }"])
+                .output().map_err(|_| "無法檢查程序；保護仍保留".to_string())?;
+            let found = if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).lines()
+                    .any(|line| line.contains("cli-proxy-api") && line.contains(config))
+            } else {
+                false
+            };
+            let observation = if found { "發現命令列包含此目錄的核心程序。" } else { "未在程序命令列中找到此目錄；核心程序已終止。" };
+            return Ok(format!("{observation} 執行目錄：{}。保護仍保留，請確認後清除。", runtime.display()));
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         Ok(format!("執行目錄：{}。此平台的程序檢查尚未實作；保護仍保留。", runtime.display()))
     }).await.map_err(|_| "檢查工作失敗".to_string())?
 }
@@ -466,23 +617,72 @@ async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
         let runtime = instance::desktop_guard_runtime(&guard, &dir.join("runtime"))?;
         #[cfg(target_os = "macos")]
         {
-            let output = std::process::Command::new("/bin/ps").args(["-axo", "command="])
+            let output = std::process::Command::new("/bin/ps").args(["-axo", "pid,command="])
                 .output().map_err(|_| "無法檢查程序".to_string())?;
             if !output.status.success() { return Err("程序檢查失敗".into()); }
             let config = runtime.join("config.yaml");
             let config_str = config.to_str().ok_or("路徑無法顯示")?;
-            let found = String::from_utf8_lossy(&output.stdout).lines()
-                .any(|line| line.contains("cli-proxy-api") && line.contains(config_str));
-            if found {
-                return Err("偵測到舊核心程序仍在執行中，請先終止舊程序後再清除保護".into());
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if line.contains("cli-proxy-api") && line.contains(config_str) {
+                    if let Some(pid_str) = line.split_whitespace().next() {
+                        let _ = std::process::Command::new("kill").args(["-TERM", pid_str]).output();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let config = runtime.join("config.yaml");
+            let config_str = config.to_str().ok_or("路徑無法顯示")?;
+
+            // 1. 若舊核心仍在執行，主動強制終止對應設定檔的 cli-proxy-api 程序
+            let _ = std::process::Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .env("TARGET_CONFIG", config_str)
+                .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*cli-proxy-api*' -and $_.CommandLine -and $_.CommandLine.Contains($env:TARGET_CONFIG) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"])
+                .output();
+
+            // 若有記錄 pid 檔案，也確認終止該 pid
+            let pid_file = dir.join("gateway.pid");
+            if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_text.trim().parse::<u32>() {
+                    let kill_cmd = format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue");
+                    let _ = std::process::Command::new("powershell")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .args(["-NoProfile", "-Command", &kill_cmd])
+                        .output();
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(400));
+
+            // 2. 複查是否仍有殘留程序
+            let output = std::process::Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .env("TARGET_CONFIG", config_str)
+                .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*cli-proxy-api*' -and $_.CommandLine -and $_.CommandLine.Contains($env:TARGET_CONFIG) } | ForEach-Object { $_.CommandLine }"])
+                .output().map_err(|e| format!("無法檢查程序：{e}"))?;
+            let still_running = if output.status.success() {
+                !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            } else {
+                false
+            };
+            if still_running {
+                return Err("無法自動終止舊核心程序，請由工作管理員手動結束 cli-proxy-api.exe 後重試".into());
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         return Err("此平台尚無法確認舊核心是否停止；保護紀錄仍保留".into());
-        #[cfg(target_os = "macos")]
-        std::fs::remove_file(&guard).map_err(|e| format!("無法移除啟動保護檔：{e}"))?;
-        #[cfg(target_os = "macos")]
-        Ok("已確認舊程序停止並移除保護紀錄；登入憑證已保留".into())
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let _ = std::fs::remove_file(dir.join("gateway.pid"));
+            std::fs::remove_file(&guard).map_err(|e| format!("無法移除啟動保護檔：{e}"))?;
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Ok("已終止舊核心程序並成功清除保護紀錄；登入憑證已保留".into())
     }).await.map_err(|_| "清除工作失敗".to_string())?
 }
 
@@ -689,14 +889,125 @@ async fn log_message(app: tauri::AppHandle, level: String, message: String, deta
     }).await.map_err(|_| "日誌寫入失敗".to_string())?
 }
 
+fn run_headless_daemon() {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| format!("{home}\\AppData\\Roaming"));
+    let lock_dir = PathBuf::from(appdata).join("io.github.zacktools.modelbridge");
+    let runtime_dir = lock_dir.join("runtime");
+    let guard_path = lock_dir.join("gateway.running");
+    let pid_file = lock_dir.join("gateway.pid");
+
+    // 若背景程序已在執行，直接返回
+    if guard_path.exists() {
+        if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_text.trim().parse::<u32>() {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x08000000;
+                    let check_cmd = format!("Get-Process -Id {pid} -ErrorAction SilentlyContinue | Where-Object {{ $_.ProcessName -like '*cli-proxy-api*' }} | Select-Object -ExpandProperty Id");
+                    if let Ok(out) = std::process::Command::new("powershell")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .args(["-NoProfile", "-Command", &check_cmd])
+                        .output()
+                    {
+                        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&guard_path);
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    let _instance_lock = match instance::acquire(&lock_dir.join("gateway.lock")) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+
+    let core_dir = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from).or_else(|| {
+        let mut d = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        for _ in 0..6 {
+            let c = d.join(".cache").join("cliproxyapi");
+            if c.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" }).exists() {
+                return Some(c);
+            }
+            d = d.parent()?.to_path_buf();
+        }
+        None
+    });
+    let Some(core_dir) = core_dir else { return; };
+    let binary = core_dir.join(if cfg!(windows) { "cli-proxy-api.exe" } else { "cli-proxy-api" });
+    if !binary.exists() { return; }
+
+    let Ok((gateway_key, management_key)) = ensure_local_keys(&lock_dir) else { return; };
+    let _ = std::fs::create_dir_all(&runtime_dir);
+    let auth_dir = runtime_dir.join("auth");
+    let _ = std::fs::create_dir_all(&auth_dir);
+
+    if instance::create_run_guard(&guard_path, &runtime_dir).is_err() {
+        return;
+    }
+
+    let preferred_port = std::env::var("APP_AGG_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(50833);
+    let selected_port = if agg_core::supervisor::ensure_port_free(preferred_port).is_ok() {
+        Some(preferred_port)
+    } else {
+        None
+    };
+
+    let result = Supervisor::start_detailed(StartRequest {
+        program: binary,
+        work_dir: runtime_dir.clone(),
+        port: selected_port,
+        extra_env: vec![],
+        health_timeout: Duration::from_secs(45),
+        gateway_key: gateway_key.clone(),
+        management_password: management_key.clone(),
+    });
+
+    if let Ok(mut process) = result {
+        let port = process.port;
+        let child_pid = process.pid();
+        if let Some(pid) = child_pid {
+            let _ = std::fs::write(lock_dir.join("gateway.pid"), pid.to_string());
+        }
+
+        // 同步登入憑證與自動還原 ChatGPT Desktop 連線
+        let env_codex = std::env::var("CODEX_HOME").ok();
+        let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+        let os = std::env::consts::OS;
+        if let Ok(info) = agg_core::codex::detect_codex_home(env_codex.as_deref(), env_home.as_deref(), os) {
+            if let Some(parent) = info.cli_config_path.parent() {
+                let _ = agg_core::codex::sync_chatgpt_desktop_auth(&auth_dir, parent);
+                let _ = agg_core::codex::resume_config(&info.cli_config_path, port, &gateway_key);
+            }
+        }
+
+        process.detach();
+    } else {
+        let _ = std::fs::remove_file(&guard_path);
+    }
+}
+
 fn main() {
-    if std::env::var("APP_AGG_OPEN_UI").ok().as_deref() != Some("1") {
+    if std::env::args().any(|arg| arg == "--probe") {
         println!("{}", serde_json::to_string_pretty(&agg_core::assess_platform()).unwrap_or_default());
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--daemon" || arg == "--headless") {
+        run_headless_daemon();
         return;
     }
     let app = tauri::Builder::default().manage(Arc::new(Mutex::new(Gateway::default())) as Shared)
         .invoke_handler(tauri::generate_handler![
             auto_start_enabled, start_gateway, stop_gateway, codex_suspend, codex_resume, set_retain_on_exit, gateway_status, inspect_previous_gateway, clear_run_guard,
+            get_autostart_gateway, set_autostart_gateway,
             oauth_start, oauth_action, discovered_models, verify_model_roundtrip, log_message,
             codex_detect, codex_status, codex_preview, codex_apply, codex_rollback, sync_model_catalog, sync_chatgpt_auth
         ])
@@ -791,4 +1102,55 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
+    #[test]
+    fn codex_desktop_suspend_restores_native_catalog() {
+        tauri::async_runtime::block_on(async {
+            let mut nonce = [0u8; 8];
+            getrandom::getrandom(&mut nonce).unwrap();
+            let dir = std::env::temp_dir().join(format!("agg-desk-suspend-{}", pin::sha256_bytes(&nonce)));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            std::fs::write(&path, "personality = \"tester\"\n").unwrap();
+
+            let cat_path = dir.join("model_catalog.json");
+            let initial = serde_json::json!({
+                "models": [
+                    { "slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "description": "Native" },
+                    { "slug": "ccs-gemini/gemini-3.7-flash", "display_name": "CC Switch", "comp_hash": "cc-switch" },
+                    { "slug": "gemini-3.8-flash-high", "display_name": "Aggregated", "description": "model-bridge aggregated model: gemini-3.8-flash-high" }
+                ]
+            });
+            std::fs::write(&cat_path, serde_json::to_string(&initial).unwrap()).unwrap();
+
+            let req = agg_core::codex::ApplyRequest {
+                config_path: path.clone(),
+                base_url: "http://127.0.0.1:12345/v1".into(),
+                gateway_key: "gwkey12345678".into(),
+                model: Some("gemini-3.8-flash-high".into()),
+                allow_foreign_override: false,
+                model_catalog_json: Some(cat_path.clone()),
+            };
+            agg_core::codex::apply_config(&req).unwrap();
+
+            // Run codex_suspend
+            let suspended = codex_suspend(Some(path.to_str().unwrap().to_string())).await.unwrap();
+            assert!(suspended);
+
+            // Verify config.toml removed model_provider
+            let cfg_str = std::fs::read_to_string(&path).unwrap();
+            assert!(!cfg_str.contains("model_provider ="));
+            assert!(!cfg_str.contains("model_catalog_json ="));
+            assert!(!cfg_str.contains("model ="));
+
+            // Verify model_catalog.json restored to purely native
+            let cat_text = std::fs::read_to_string(&cat_path).unwrap();
+            let cat_json: serde_json::Value = serde_json::from_str(&cat_text).unwrap();
+            let models = cat_json["models"].as_array().unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0]["slug"], "gpt-6-astra");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
 }

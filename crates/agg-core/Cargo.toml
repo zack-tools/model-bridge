@@ -1,9 +1,9 @@
-[package]
+﻿[package]
 name = "agg-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "APP-AGG-001 phase 1 shared contract for a managed CLIProxyAPI sidecar"
+description = "model-bridge phase 1 shared contract for a managed CLIProxyAPI sidecar"
 
 [[bin]]
 name = "agg-poc"
