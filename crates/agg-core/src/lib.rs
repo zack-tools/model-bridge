@@ -1,4 +1,4 @@
-//! Shared APP-AGG-001 phase 1 contract.
+﻿//! Shared model-bridge phase 1 contract.
 //!
 //! The desktop shell and the headless checker both call this crate.
 //! Nothing here completes a real provider login or marks a model verified

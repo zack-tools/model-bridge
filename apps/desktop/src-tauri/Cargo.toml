@@ -1,9 +1,9 @@
-[package]
-name = "app-agg-001-desktop"
+﻿[package]
+name = "model-bridge-desktop"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "APP-AGG-001 phase 1 thin Tauri shell. Not compiled in the headless PoC run."
+description = "model-bridge phase 1 thin Tauri shell. Not compiled in the headless PoC run."
 
 [build-dependencies]
 tauri-build = "=2.7.4"

@@ -1,4 +1,4 @@
-//! Per-user lock for the desktop gateway. The lock file must not be deleted.
+﻿//! Per-user lock for the desktop gateway. The lock file must not be deleted.
 use fs2::FileExt;
 use std::{fs::{File, OpenOptions}, io::Write, path::{Path, PathBuf}};
 
@@ -113,7 +113,7 @@ pub fn find_core_binary() -> Result<PathBuf, String> {
         }
     }
     let candidates = [
-        PathBuf::from("/Users/Zack/Documents/Codex/2026-11-06/app-agg-001/.cache/cliproxyapi"),
+        PathBuf::from("/Users/Zack/Documents/Codex/2026-11-06/model-bridge/.cache/cliproxyapi"),
         default_app_data_dir().unwrap_or_default().join("core"),
     ];
     for dir in &candidates {

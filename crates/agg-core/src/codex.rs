@@ -1,4 +1,4 @@
-//! Codex config adapter.
+﻿//! Codex config adapter.
 //!
 //! Operates on a caller-supplied path. Detection does not create directories
 //! and does not treat a desktop-client path as known. Apply preserves unrelated
@@ -105,6 +105,139 @@ pub struct CatalogSyncSummary {
     pub existing_slugs: Vec<String>,
 }
 
+
+fn is_cc_switch_model(entry: &serde_json::Value) -> bool {
+    let slug = entry.get("slug").and_then(|s| s.as_str()).unwrap_or("");
+    let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
+    let comp = entry.get("comp_hash").and_then(|s| s.as_str()).unwrap_or("");
+    let display = entry.get("display_name").and_then(|s| s.as_str()).unwrap_or("");
+
+    comp == "cc-switch"
+        || slug.starts_with("ccs-")
+        || display.contains("Gemini-OAuth")
+        || display.contains("cc-switch")
+        || desc.contains("cc-switch")
+}
+
+fn is_model_bridge_model(entry: &serde_json::Value) -> bool {
+    let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
+    desc.starts_with("model-bridge aggregated model:")
+}
+
+/// Restore catalog by removing any non-native (ModelBridge or CC Switch) models.
+pub fn restore_native_catalog(catalog_path: &Path) -> Result<bool, CodexError> {
+    reject_symlink(catalog_path)?;
+    if !catalog_path.exists() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(catalog_path).map_err(|e| CodexError::Message(e.to_string()))?;
+    let mut root: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| CodexError::Message(format!("json parse: {e}")))?;
+
+    let models_arr = match root.get_mut("models").and_then(|v| v.as_array_mut()) {
+        Some(arr) => arr,
+        None => return Ok(false),
+    };
+
+    let before_len = models_arr.len();
+    models_arr.retain(|entry| {
+        !is_cc_switch_model(entry) && !is_model_bridge_model(entry)
+    });
+
+    if models_arr.len() != before_len {
+        let new_text = serde_json::to_string_pretty(&root)
+            .map_err(|e| CodexError::Message(e.to_string()))?;
+        atomic_write(catalog_path, new_text.as_bytes())?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+
+/// Format model slug into standard user-facing display name, avoiding ALL-CAPS and simplifying trailing tier suffixes (-high, -medium, -low).
+pub fn format_model_display_name(model: &str) -> String {
+    let base_model = if let Some(stripped) = model.strip_suffix("-high") {
+        stripped
+    } else if let Some(stripped) = model.strip_suffix("-medium") {
+        stripped
+    } else if let Some(stripped) = model.strip_suffix("-low") {
+        stripped
+    } else {
+        model
+    };
+
+    if base_model.starts_with("gemini") {
+        base_model
+            .replace('-', " ")
+            .split_whitespace()
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else if base_model.starts_with("gpt-") || base_model.starts_with("gpt") {
+        base_model
+            .split('-')
+            .map(|part| {
+                if part.eq_ignore_ascii_case("gpt") {
+                    "GPT".to_string()
+                } else if part.eq_ignore_ascii_case("oss") {
+                    "OSS".to_string()
+                } else {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => {
+                            let mut s = first.to_uppercase().collect::<String>();
+                            s.push_str(&part[first.len_utf8()..].to_lowercase());
+                            s
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("-")
+    } else if base_model.starts_with("claude") {
+        base_model
+            .replace('-', " ")
+            .split_whitespace()
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => {
+                        let mut s = f.to_uppercase().collect::<String>();
+                        s.push_str(&w[f.len_utf8()..].to_lowercase());
+                        s
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        base_model
+            .split('-')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => {
+                        let mut s = first.to_uppercase().collect::<String>();
+                        s.push_str(&part[first.len_utf8()..].to_lowercase());
+                        s
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+}
+
 pub fn sync_model_catalog(
     catalog_path: &Path,
     verified_models: &[String],
@@ -121,7 +254,7 @@ pub fn sync_model_catalog(
 
     let (mut root, backup_path) = if existed {
         let text = fs::read_to_string(catalog_path).map_err(|e| CodexError::Message(e.to_string()))?;
-        let backup_name = format!("{}.app-agg-001.bak", file_name(catalog_path)?);
+        let backup_name = format!("{}.model-bridge.bak", file_name(catalog_path)?);
         let bpath = parent.join(&backup_name);
         fs::copy(catalog_path, &bpath).map_err(|e| CodexError::Message(e.to_string()))?;
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| CodexError::Message(format!("json parse: {e}")))?;
@@ -134,12 +267,11 @@ pub fn sync_model_catalog(
         .and_then(|v| v.as_array_mut())
         .ok_or_else(|| CodexError::Message("model_catalog.json does not contain a 'models' array".into()))?;
 
-    // 依使用者指示：移除先前加入之不支援串流工具回合的 image 模型條目
+    // 依使用者指示：徹底過濾 CC Switch 模型條目與先前加入之 model-bridge 模型
     models_arr.retain(|entry| {
         let slug = entry.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-        let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
-        let is_agg_image = desc.starts_with("APP-AGG-001 aggregated model:") && slug.to_ascii_lowercase().contains("image");
-        !is_agg_image
+        let is_image = slug.to_ascii_lowercase().contains("image");
+        !is_cc_switch_model(entry) && !is_model_bridge_model(entry) && !is_image
     });
 
     let mut existing_slugs = Vec::new();
@@ -147,41 +279,30 @@ pub fn sync_model_catalog(
 
     for model in verified_models {
         if model.trim().is_empty() || model.to_ascii_lowercase().contains("image") { continue; }
-        let already = models_arr.iter().any(|entry| {
+        let display_name = format_model_display_name(model);
+        if let Some(existing) = models_arr.iter_mut().find(|entry| {
             entry.get("slug").and_then(|s| s.as_str()) == Some(model.as_str())
-        });
-        if already {
+        }) {
+            if is_model_bridge_model(existing) {
+                if let Some(obj) = existing.as_object_mut() {
+                    obj.insert("display_name".into(), serde_json::json!(display_name));
+                }
+            }
             existing_slugs.push(model.clone());
         } else {
-            let display_name = if model.starts_with("gemini") {
-                model.replace('-', " ")
-                    .split_whitespace()
-                    .map(|w| {
-                        let mut c = w.chars();
-                        match c.next() {
-                            None => String::new(),
-                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            } else if model.starts_with("gpt") {
-                model.to_uppercase()
+            let entry = if let Some(tpl) = if model.contains("gemini") {
+                models_arr.iter().find(|e| e.get("slug").and_then(|s| s.as_str()).map_or(false, |s| s.contains("gemini")))
+            } else if model.contains("gpt") {
+                models_arr.iter().find(|e| e.get("slug").and_then(|s| s.as_str()).map_or(false, |s| s.contains("gpt")))
             } else {
-                model.to_string()
-            };
-            let entry = if let Some(tpl) = if model.starts_with("gemini") {
-                models_arr.iter().find(|e| e.get("slug").and_then(|s| s.as_str()).map_or(false, |s| s.starts_with("gemini")))
-            } else if model.starts_with("gpt") {
-                models_arr.iter().find(|e| e.get("slug").and_then(|s| s.as_str()).map_or(false, |s| s.starts_with("gpt")))
-            } else {
-                None
-            } {
+                models_arr.first()
+            }.or_else(|| models_arr.first()) {
                 let mut cloned = tpl.clone();
                 if let Some(obj) = cloned.as_object_mut() {
+                    obj.remove("comp_hash");
                     obj.insert("slug".into(), serde_json::json!(model));
                     obj.insert("display_name".into(), serde_json::json!(display_name));
-                    obj.insert("description".into(), serde_json::json!(format!("APP-AGG-001 aggregated model: {model}")));
+                    obj.insert("description".into(), serde_json::json!(format!("model-bridge aggregated model: {model}")));
                     obj.insert("priority".into(), serde_json::json!(5));
                     obj.insert("visibility".into(), serde_json::json!("list"));
                     obj.insert("supported_in_api".into(), serde_json::json!(true));
@@ -229,7 +350,7 @@ pub fn sync_model_catalog(
                 serde_json::json!({
                     "slug": model,
                     "display_name": display_name,
-                    "description": format!("APP-AGG-001 aggregated model: {model}"),
+                    "description": format!("model-bridge aggregated model: {model}"),
                     "visibility": "list",
                     "supported_in_api": true,
                     "priority": 5,
@@ -238,7 +359,17 @@ pub fn sync_model_catalog(
                     "support_verbosity": true,
                     "default_reasoning_level": def_reason,
                     "supported_reasoning_levels": supp_reason,
-                    "shell_type": "unified_exec"
+                    "shell_type": "unified_exec",
+                    "truncation_policy": {
+                        "limit": 10000,
+                        "mode": "bytes"
+                    },
+                    "context_window": 272000,
+                    "max_context_window": 272000,
+                    "auto_compact_token_limit": 244800,
+                    "effective_context_window_percent": 95,
+                    "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+                    "additional_speed_tiers": []
                 })
             };
             models_arr.push(entry);
@@ -449,7 +580,7 @@ pub fn sync_chatgpt_desktop_auth(
 
         // 本機閘道有最新憑證 -> 同步至 ~/.codex/auth.json
         let backup_path = if auth_existed {
-            let bpath = codex_home.join("auth.json.app-agg-001.bak");
+            let bpath = codex_home.join("auth.json.model-bridge.bak");
             let _ = fs::copy(&auth_path, &bpath);
             Some(bpath)
         } else {
@@ -606,7 +737,13 @@ pub fn inspect_codex_config(config_path: &Path) -> Result<CodexConfigStatus, Cod
             if let Some(ownership) = ownership {
                 managed_by_us = true;
                 let current_hash = crate::pin::sha256_bytes(content.as_bytes());
-                external_edit_detected = current_hash != ownership.sha256;
+                if current_hash != ownership.sha256 {
+                    let norm_cur = hash_without_model(&content).unwrap_or_default();
+                    let ref_norm = ownership.sha256_without_model.as_deref().unwrap_or(&ownership.sha256);
+                    external_edit_detected = norm_cur != ref_norm;
+                } else {
+                    external_edit_detected = false;
+                }
                 if let Some(backup_name) = &ownership.backup {
                     if let Some(parent) = config_path.parent() {
                         has_backup = parent.join(backup_name).exists();
@@ -650,6 +787,16 @@ struct Ownership {
 fn hash_without_model(text: &str) -> Result<String, CodexError> {
     let mut doc = text.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
     doc.remove("model");
+    doc.remove("model_reasoning_effort");
+    if let Some(mcp) = doc.get_mut("mcp_servers").and_then(Item::as_table_like_mut) {
+        if let Some(node) = mcp.get_mut("node_repl").and_then(Item::as_table_like_mut) {
+            if let Some(env) = node.get_mut("env").and_then(Item::as_table_like_mut) {
+                if env.contains_key("SKY_CUA_NATIVE_PIPE_DIRECTORY") {
+                    env.insert("SKY_CUA_NATIVE_PIPE_DIRECTORY", toml_edit::value("normalized_cua_pipe"));
+                }
+            }
+        }
+    }
     Ok(crate::pin::sha256_bytes(doc.to_string().as_bytes()))
 }
 
@@ -660,7 +807,7 @@ struct SuspendedConfig {
 }
 
 fn suspended_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!("{}.app-agg-001.suspended.json", path.file_name().and_then(|s| s.to_str()).unwrap_or("config.toml")))
+    path.with_file_name(format!("{}.model-bridge.suspended.json", path.file_name().and_then(|s| s.to_str()).unwrap_or("config.toml")))
 }
 
 /// Switch a verified managed configuration to the client's native defaults.
@@ -668,8 +815,20 @@ pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
     reject_symlink(path)?;
     let marker = suspended_path(path);
     reject_symlink(&marker)?;
-    if marker.exists() { return Err(CodexError::Message("已有尚未恢復的閘道設定".into())); }
-    let Some(mut owner) = read_ownership(&ownership_path(path))? else { return Ok(false); };
+    if marker.exists() {
+        if let Some(parent) = path.parent() {
+            let cat_path = parent.join("model_catalog.json");
+            let _ = restore_native_catalog(&cat_path);
+        }
+        return Ok(true);
+    }
+    let Some(mut owner) = read_ownership(&ownership_path(path))? else {
+        if let Some(parent) = path.parent() {
+            let cat_path = parent.join("model_catalog.json");
+            let _ = restore_native_catalog(&cat_path);
+        }
+        return Ok(false);
+    };
     let active = read_existing(path)?;
     if crate::pin::sha256_bytes(active.as_bytes()) != owner.sha256 {
         let reference = if let Some(hash) = &owner.sha256_without_model {
@@ -692,11 +851,18 @@ pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
     doc.remove("model_provider");
     doc.remove("model_catalog_json");
     doc.remove("model");
+    doc.remove("model_reasoning_effort");
     let native = doc.to_string();
     let record = SuspendedConfig { active, native_hash: crate::pin::sha256_bytes(native.as_bytes()) };
     let bytes = serde_json::to_vec(&record).map_err(|e| CodexError::Message(e.to_string()))?;
     atomic_write(&marker, &bytes)?;
     atomic_write(path, native.as_bytes())?;
+
+    if let Some(parent) = path.parent() {
+        let cat_path = parent.join("model_catalog.json");
+        let _ = restore_native_catalog(&cat_path);
+    }
+
     Ok(true)
 }
 
@@ -709,7 +875,18 @@ pub fn resume_config(path: &Path, port: u16, gateway_key: &str) -> Result<bool, 
     let record: SuspendedConfig = serde_json::from_slice(&fs::read(&marker).map_err(|e| CodexError::Message(e.to_string()))?)
         .map_err(|e| CodexError::Message(e.to_string()))?;
     let current = read_existing(path)?;
-    if crate::pin::sha256_bytes(current.as_bytes()) != record.native_hash { return Err(CodexError::ExternalEdit); }
+    if crate::pin::sha256_bytes(current.as_bytes()) != record.native_hash {
+        let norm_cur = hash_without_model(&current)?;
+        let mut rec_doc = record.active.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+        rec_doc.remove("model_provider");
+        rec_doc.remove("model_catalog_json");
+        rec_doc.remove("model");
+        rec_doc.remove("model_reasoning_effort");
+        let norm_rec_native = hash_without_model(&rec_doc.to_string())?;
+        if norm_cur != norm_rec_native {
+            return Err(CodexError::ExternalEdit);
+        }
+    }
     let mut owner = read_ownership(&ownership_path(path))?.ok_or(CodexError::NothingToRollBack)?;
     if crate::pin::sha256_bytes(record.active.as_bytes()) != owner.sha256 { return Err(CodexError::RollbackConflict); }
     let req = ApplyRequest { config_path: path.to_path_buf(), base_url: format!("http://127.0.0.1:{port}/v1"), gateway_key: gateway_key.into(), model: None, allow_foreign_override: false, model_catalog_json: None };
@@ -751,7 +928,7 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
     let generation = previous.as_ref().map(|o| o.generation + 1).unwrap_or(1);
     let backup_name = if existed {
         let name = format!(
-            "{}.{generation}.app-agg-001.bak",
+            "{}.{generation}.model-bridge.bak",
             file_name(&req.config_path)?
         );
         let backup_path = parent.join(&name);
@@ -762,7 +939,7 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
     };
     atomic_write(&req.config_path, after.as_bytes())?;
     let ownership = Ownership {
-        tool: "app-agg-001".into(),
+        tool: "model-bridge".into(),
         generation,
         sha256: crate::pin::sha256_bytes(after.as_bytes()),
         managed_provider_id: PROVIDER_ID.into(),
@@ -800,6 +977,10 @@ pub fn rollback_config(config_path: &Path) -> Result<(), CodexError> {
         return Err(CodexError::NothingToRollBack);
     }
     fs::remove_file(&ownership_path).map_err(|e| CodexError::Message(e.to_string()))?;
+    if let Some(parent) = config_path.parent() {
+        let cat_path = parent.join("model_catalog.json");
+        let _ = restore_native_catalog(&cat_path);
+    }
     Ok(())
 }
 
@@ -957,7 +1138,7 @@ fn ownership_path(config: &Path) -> PathBuf {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config.toml");
-    config.with_file_name(format!("{name}.app-agg-001.ownership.json"))
+    config.with_file_name(format!("{name}.model-bridge.ownership.json"))
 }
 
 fn read_ownership(path: &Path) -> Result<Option<Ownership>, CodexError> {
@@ -1188,6 +1369,21 @@ mod tests {
         assert!(detect_codex_home(None, None, "macos").is_err());
     }
 
+
+    #[test]
+    fn format_model_display_name_avoids_all_caps() {
+        assert_eq!(format_model_display_name("gpt-6.1-terra"), "GPT-6.1-Terra");
+        assert_eq!(format_model_display_name("gpt-6-sol"), "GPT-6-Sol");
+        assert_eq!(format_model_display_name("gpt-6.1-sol"), "GPT-6.1-Sol");
+        assert_eq!(format_model_display_name("gpt-6-luna"), "GPT-6-Luna");
+        assert_eq!(format_model_display_name("gpt-5.6-sol"), "GPT-5.6-Sol");
+        assert_eq!(format_model_display_name("gpt-5.4-mini"), "GPT-5.4-Mini");
+        assert_eq!(format_model_display_name("gemini-3.8-flash-high"), "Gemini 3.8 Flash");
+        assert_eq!(format_model_display_name("gemini-3-flash"), "Gemini 3 Flash");
+        assert_eq!(format_model_display_name("gemini-3.1-flash-lite"), "Gemini 3.1 Flash Lite");
+        assert_eq!(format_model_display_name("claude-sonnet-4-6"), "Claude Sonnet 4 6");
+    }
+
     #[test]
     fn refuses_symlink_and_bad_url() {
         let dir = scratch();
@@ -1284,11 +1480,61 @@ mod tests {
         assert!(arr[1]["supported_reasoning_levels"].is_array());
         assert_eq!(arr[1]["default_reasoning_level"], "medium");
         assert_eq!(arr[2]["slug"], "gemini-3.8-flash-high");
-        assert_eq!(arr[2]["display_name"], "Gemini 3.8 Flash High");
+        assert_eq!(arr[2]["display_name"], "Gemini 3.8 Flash");
         assert_eq!(arr[2]["shell_type"], "unified_exec");
         assert!(arr[2]["supported_reasoning_levels"].is_array());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn syncs_model_catalog_filters_cc_switch_and_restores_native() {
+        let dir = scratch();
+        let cat_path = dir.join("model_catalog.json");
+        let initial = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "description": "Our most capable model",
+                    "visibility": "list"
+                },
+                {
+                    "slug": "ccs-gemini/gemini-3.7-flash",
+                    "display_name": "Gemini 3.7 (Gemini-OAuth)",
+                    "description": "from cc-switch",
+                    "comp_hash": "cc-switch",
+                    "visibility": "list"
+                }
+            ]
+        });
+        fs::write(&cat_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        let models = vec![
+            "gemini-3.8-flash-high".to_string(),
+        ];
+        let summary = sync_model_catalog(&cat_path, &models).unwrap();
+        assert_eq!(summary.total_models, 2);
+        assert_eq!(summary.added_slugs, vec!["gemini-3.8-flash-high"]);
+
+        let content = fs::read_to_string(&cat_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let arr = parsed["models"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["slug"], "gpt-6-astra");
+        assert_eq!(arr[1]["slug"], "gemini-3.8-flash-high");
+        assert!(arr[1].get("comp_hash").is_none());
+
+        // Test restore_native_catalog
+        assert!(restore_native_catalog(&cat_path).unwrap());
+        let restored_content = fs::read_to_string(&cat_path).unwrap();
+        let restored: serde_json::Value = serde_json::from_str(&restored_content).unwrap();
+        let restored_arr = restored["models"].as_array().unwrap();
+        assert_eq!(restored_arr.len(), 1);
+        assert_eq!(restored_arr[0]["slug"], "gpt-6-astra");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

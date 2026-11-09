@@ -1,10 +1,10 @@
-## Page 1
+﻿## Page 1
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第1⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
-APP-AGG-001 v1ʛCodex 聚合閘道架構與功能
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第1⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
+model-bridge v1ʛCodex 聚合閘道架構與功能
 規劃
-APP-AGG-001 v1 ⽅案已於 2026-11-06 12:13 Asia/Taipei 核准；Phase 1 PoC 已開始。
+model-bridge v1 ⽅案已於 2026-11-06 12:13 Asia/Taipei 核准；Phase 1 PoC 已開始。
 必驗平台：macOS＋Windows；Linux 為評估⽬標（非已確認正式⽀援）。程式開發已啟
 動（私⼈未公開 Origin 草稿雲端開發，無公開發⾏）；OAuth／原⽣驗證與測試結果尚未
 回報。時區 Asia/Taipei。
@@ -24,7 +24,7 @@ MVP 資訊架構
 核准與信任改進
 建議結論
 核准狀態（2026-11-06）
-12:13 Asia/Taipei：使⽤者同意⽅案，授權 APP-AGG-001 v1 與 Phase 1 PoC 開
+12:13 Asia/Taipei：使⽤者同意⽅案，授權 model-bridge v1 與 Phase 1 PoC 開
 ⼯（非核准跳過閘⾨直接進正式／MVP 發⾏）。12:16：OS 另納入 Linux 評估。
 程式⼯作已開始；測試、OAuth、原⽣桌⾯驗證尚未回報通過。開發為私⼈未公開
 Origin 草稿雲端開發，無公開發⾏。
@@ -37,8 +37,8 @@ Windows system tray）。本機閘道只暴露 loopback 的 OpenAI Responses；�
 
 ## Page 2
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第2⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第2⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 聚合清單只含 ChatGPT／Codex 與 Gemini／Antigravity 經驗證模型；不因
 Antigravity ⽂件列出 Claude 就對外暴露 Claude。
 必驗平台已確認：macOS 與 Windows；MVP 兩邊都要過。Linux 僅為評估⽬標，不標為
@@ -47,7 +47,7 @@ Antigravity ⽂件列出 Claude 就對外暴露 Claude。
 「單⼀⼯具」指單⼀操作⾯與⽣命週期，不是單⼀ OS ⾏程。基準採殼＋sidecar 兩⾏程；
 若改單⾏程，須另做 Go SDK embed PoC，通過前不可寫進 MVP 承諾。Wails 系統匣能
 ⼒本次未以官⽅⽂件核實，不列為基準。
-任務 ID APP-AGG-001 v1
+任務 ID model-bridge v1
 規劃狀態 approved · PoC in progress
 時區 Asia/Taipei
 平台（必驗） macOS + Windows
@@ -88,8 +88,8 @@ Windows／macOS 的 native 驗收
 
 ## Page 3
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第3⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第3⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 明、不承諾全發⾏版）
 7.零額外花費依賴（不含既有帳號本
 ⾝⽤量；不擅⾃購買簽章憑證或註
@@ -125,8 +125,8 @@ WebView WebView2（系統／ WKWebView（系統 WebKitGTK 與系統依
 
 ## Page 4
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第4⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第4⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 WebView WebView2（系統／
 可再發⾏；建置檢查
 項）
@@ -201,8 +201,8 @@ unavailable
 
 ## Page 5
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第5⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第5⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 聚合清單 同⼀本機入⼝下，⼿動選擇
 ChatGPT 或 Gemini 來源模型
 別名映射到實際 model id；預
@@ -235,8 +235,8 @@ OAuth／API OAuth／API
 
 ## Page 6
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第6⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第6⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 架構⽀援與「某 CPU 產物是否⿑」分開驗證。
 技術棧基準
 基準優點
@@ -273,8 +273,8 @@ Wails + Go 未定 視實作 本次未核實官⽅ tray ⽂件；不當
 
 ## Page 7
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第7⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第7⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 ProcessSupervisor 雙平台單實例鎖、啟動／停⽌／
 崩潰重啟、checksum、健康檢
 查
@@ -327,8 +327,8 @@ capabilities 只記已觀察⾏為（streaming、tool calls、multi-turn、struc
 
 ## Page 8
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第8⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第8⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 等）；缺測標 unknown。預設⼿動選模；不做⾃動 fallback。
 建議⽬錄（僅規劃）
 1.desktop/ — Tauri 殼；Windows tray／macOS menu bar 入⼝
@@ -359,8 +359,8 @@ Keychain 包裝
 
 ## Page 9
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第9⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第9⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 MVP 資訊架構（中性⽰意）
 以下為產品資訊架構，不是任何廠商 UI 仿製。
 1.⾸⾴／狀態
@@ -394,8 +394,8 @@ OAuth ⽣命週期（概念）
 
 ## Page 10
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第10⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第10⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 僅顯⽰帳號別名與狀態；token 不進 UI／⽇誌
 4 失敗即停
 認證失敗或帳號／登入警告 → 中⽌並提⽰，不重試規避
@@ -425,8 +425,8 @@ protocol-pass Responses／OAuth 回呼等協議層測試
 
 ## Page 11
 
-2026/11/7 上午10:30APP-AGG-001 v1 聚合閘道架構與功能規劃
-第11⾴（共11⾴）https://app-agg-001-v1-e35b.pages.grok.bot/
+2026/11/7 上午10:30model-bridge v1 聚合閘道架構與功能規劃
+第11⾴（共11⾴）https://model-bridge-v1-e35b.pages.grok.bot/
 integration-pass 與釘選 core 的整合測試（標明架構）
 ui-verified-native-desktop 在該 OS 原⽣桌⾯實機操作驗證（禁⽌⽤ Wine 代
 替 Windows；禁⽌⽤未跑測試充通過）

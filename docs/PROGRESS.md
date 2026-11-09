@@ -1,4 +1,4 @@
-# APP-AGG-001 開發進度
+﻿# model-bridge 開發進度
 
 最後更新：2026-11-07（Asia/Taipei）
 
@@ -13,7 +13,7 @@
 
 ## 目標與來源
 
-依 [v1 規劃逐頁轉錄](APP-AGG-001-v1-plan.md) 完成 Phase 1 PoC。macOS 與 Windows 為個別必驗平台；Linux 僅作額外評估。MVP／正式發布須先通過規劃中的雙平台 PoC 閘門。
+依 [v1 規劃逐頁轉錄](model-bridge-v1-plan.md) 完成 Phase 1 PoC。macOS 與 Windows 為個別必驗平台；Linux 僅作額外評估。MVP／正式發布須先通過規劃中的雙平台 PoC 閘門。
 
 ## 已完成與證據
 
@@ -74,6 +74,7 @@
 | ChatGPT Desktop 保持帳號登入支援（Account Persistence & Bi-directional Sync） | 解決使用者在 ChatGPT Desktop (`ChatGPT.app`) 中因代理設定喪失帳號登入態之問題：(1) 定位根因為 `config.toml` 中 `requires_openai_auth = false` 會導致 Electron UI 關閉認證協議與 Session 模組，並出現未登入態；在 `agg-core::codex` 固化 `requires_openai_auth = true`，使 ChatGPT Desktop 保持 Attach-Auth 且順暢通過閘道驗證；(2) 實作本機雙向憑證同步模組 `sync_chatgpt_desktop_auth`：當本地閘道有最新憑證時自動注入 `~/.codex/auth.json`（0600 權限與原子寫入），若使用者在 ChatGPT Desktop 原生重新登入時亦能自 `auth.json` 反向導入本地 `runtime/auth/`；(3) 在 CLI 工具加入 `agg-poc sync-auth`，並在 `agg-poc start`、`agg-poc apply`、Tauri `start_gateway`、`codex_apply` 與桌面 UI（「同步 ChatGPT 登入憑證」按鈕）全面自動觸發同步；(4) 實測驗證：`codex doctor --json` 顯示 `auth.credentials` 通過且 `stored ChatGPT tokens: true`，ChatGPT Desktop 啟動日誌確認 `authenticatedAccountPresent=true`、`hasAccount=true`、`hasUser=true`，頭像/Plus 會員權益完整維持，`gpt-6.1-terra` 與 `gemini-3.8-flash-high` 雙模型串流正常回傳 | 工作區 70 項測試全綠（`agg-core` 68 項、桌面端 2 項）；`agg-poc sync-auth` 與 `status` 實測確認登入維持；ChatGPT.app 日誌無任何未登入警告 |
 | 供應商名稱對齊 Custom（Native Provider Alignment） | 依使用者指示將提供者名稱全面改為官方原生標識 `Custom`：(1) 於 `agg-core::codex` 將 `PROVIDER_ID` 固化為 `"custom"`，`mutate()` 產生 `name = "Custom"` 與 `model_provider = "custom"`；(2) 同時同步更新 `[model_providers.custom]` 與 `[model_providers.app_agg_001]` 雙向配置；(3) 實測套用至 `~/.codex/config.toml`；`codex doctor --json` 確認 `model provider: "custom"`；雙模型呼叫（`gpt-6.1-terra`、`gemini-3.8-flash-high`）實測經由 `provider: custom` 串流成功回傳 `CUSTOM_PROVIDER_GPT_OK` 與 `CUSTOM_PROVIDER_GEMINI_OK` | 工作區 70 項測試全綠；`codex doctor` 報告配置正常；OpenAI Codex CLI 與 ChatGPT Desktop 完全對齊 Custom 提供者 |
 | 桌面端 UI/UX 現代化全面升級（Modern Desktop System & One-Click Setup） | 依使用者指示進行 UI/UX 深度優化：(1) 視覺設計系統升級：導入 Apple HIG 現代卡片質感、毛玻璃微陰影、呼吸狀態光點（🟢/🔴）、深淺色模式自適應，擺脫原型期純 HTML；(2) 頂部即時儀表板（Dashboard）：展示閘道端點（127.0.0.1:50833）、ChatGPT Desktop 整合狀態（Custom）、有效帳號數（2 個）與可用模型數（16 款）；(3) 互動流程革新（UX）：推出「⚡️ 一鍵設定 ChatGPT Desktop」，三步合一（同步模型目錄 + 套用 Custom 閘道 + 雙向同步登入憑證），免去多次切換點擊；(4) 操作體驗增強：新增「📋 複製日誌」快捷按鈕、按鈕非同步 Loading 防重複點擊、狀態條即時回饋，並 100% 保留原有 DOM ID 與後端 Tauri 命令相容性 | 測試套件 70 項全綠；桌面前端靜態與動態事件綁定完整無報錯 |
+| Windows 原生相容性與修復：CMD 視窗消除、CC Switch 殘留隔離與關閉閘道還原 | 依使用者指示完成三項 Windows 平台修復：(1) **啟動閘道 CMD 彈窗**：在 `supervisor.rs` 啟動 `cli-proxy-api.exe` 加入 Windows `CREATE_NO_WINDOW (0x08000000)` flag，消除彈窗且防止關閉視窗殺死閘道；(2) **模型清單混雜 CC Switch**：在 `codex.rs` 的 `sync_model_catalog` 全面過濾 CC Switch 注入條目（`comp_hash: "cc-switch"`、`slug: "ccs-*"`、`display_name: "Gemini-OAuth"`）與歷史代理模型，並在克隆模板時主動移除 `comp_hash`，確保 ChatGPT Desktop 模型選單僅呈現原生 OpenAI 與驗證通過之 ModelBridge 模型；(3) **關閉閘道還原原生清單**：修復 `suspend_config` 因 Windows 具名管道（`SKY_CUA_NATIVE_PIPE_DIRECTORY`）動態變更而誤報 `external edit` 拒絕切換之問題（加入 volatile 欄位正規化）；實作 `restore_native_catalog` 並於 `suspend_config`、`rollback_config` 及桌面端 `stop_gateway` 自動連動還原 `model_catalog.json` 為純原生清單。 | 單元測試 `syncs_model_catalog_filters_cc_switch_and_restores_native` 與桌面端 `codex_desktop_suspend_restores_native_catalog` 通過；`codex doctor` 報告 0 fail；Release 二進位檔編譯完成並實測生效 |
 
 macOS sidecar 由 lsof 觀察到 IPv4 loopback、未見 wildcard；非 loopback 連線探測無結果，不能據此宣稱已完成外網連線驗證。原生視窗顯示不代表互動式桌面功能已驗收。
 

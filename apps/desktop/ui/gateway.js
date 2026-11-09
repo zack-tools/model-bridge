@@ -710,3 +710,33 @@ if (retainCheckbox) {
     } catch (_) {}
   });
 }
+
+const autostartCheckbox = document.getElementById('autostart-gateway');
+const autostartStatus = document.getElementById('autostart-status');
+if (autostartCheckbox) {
+  // 查詢目前開機自啟設定狀態
+  window.__TAURI__.core.invoke('get_autostart_gateway').then(enabled => {
+    autostartCheckbox.checked = !!enabled;
+    if (autostartStatus) {
+      autostartStatus.textContent = enabled ? '🟢 已開啟（開機背景開閘）' : '⚪ 未啟用';
+    }
+  }).catch(() => {
+    if (autostartStatus) autostartStatus.textContent = '';
+  });
+
+  autostartCheckbox.addEventListener('change', async () => {
+    try {
+      const enabled = await window.__TAURI__.core.invoke('set_autostart_gateway', { enabled: autostartCheckbox.checked });
+      autostartCheckbox.checked = !!enabled;
+      if (autostartStatus) {
+        autostartStatus.textContent = enabled ? '🟢 已開啟（開機背景開閘）' : '⚪ 未啟用';
+      }
+      appendLog('SUCCESS', `開機自動開閘設定已更新：${enabled ? '已啟用（開機自動在背景啟動閘道，不開 UI）' : '已關閉開機自動開閘'}`);
+    } catch (err) {
+      appendLog('ERROR', '開機自動開閘設定失敗', err);
+      if (autostartStatus) {
+        autostartStatus.textContent = `⚠️ 設定失敗：${err}`;
+      }
+    }
+  });
+}

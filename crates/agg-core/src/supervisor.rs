@@ -101,6 +101,10 @@ impl Supervisor {
         command.env_clear();
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            command.creation_flags(CREATE_NO_WINDOW);
+
             let system_root = std::env::var_os("SystemRoot")
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| "SystemRoot is missing; cannot prepare Windows runtime".to_string())?;

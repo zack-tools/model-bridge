@@ -62,17 +62,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "app-agg-001-desktop"
-version = "0.1.0"
-dependencies = [
- "agg-core",
- "getrandom 0.2.15",
- "serde_json",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
 name = "arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1759,6 +1748,17 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "model-bridge-desktop"
+version = "0.1.0"
+dependencies = [
+ "agg-core",
+ "getrandom 0.2.15",
+ "serde_json",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]

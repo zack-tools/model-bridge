@@ -560,6 +560,13 @@
             <button id="clear-guard" type="button" style="display:none; font-size:0.78rem;" class="btn-danger">清除保護紀錄</button>
           </div>
         </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-top:0.5rem; padding-top:0.5rem; border-top:1px dashed var(--border-color);">
+          <label class="checkbox-label">
+            <input id="autostart-gateway" type="checkbox">
+            <strong>開機自動在背景啟動閘道</strong>（直接連線，不啟動 UI 視窗）
+          </label>
+          <span id="autostart-status" class="field-note" style="margin:0;">檢查中…</span>
+        </div>
         <p id="inspection" class="field-note" role="status" aria-live="polite"></p>
       </section>
 
