@@ -666,6 +666,12 @@ pub fn inspect_codex_config(config_path: &Path) -> Result<CodexConfigStatus, Cod
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ConfigOrigin {
+    created: bool,
+    backup: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ownership {
     tool: String,
@@ -676,6 +682,12 @@ struct Ownership {
     created: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256_without_model: Option<String>,
+    /// Content from before the first ModelBridge apply. Later applies keep this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<ConfigOrigin>,
+    /// Hash of the managed keys only. Unowned tables such as `[projects.*]` are omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256_managed: Option<String>,
 }
 
 fn hash_without_model(text: &str) -> Result<String, CodexError> {
@@ -692,6 +704,89 @@ fn hash_without_model(text: &str) -> Result<String, CodexError> {
         }
     }
     Ok(crate::pin::sha256_bytes(doc.to_string().as_bytes()))
+}
+
+fn is_toml_table(item: &Item) -> bool {
+    item.is_table() || item.is_inline_table()
+}
+
+fn is_managed_provider(name: &str) -> bool {
+    name == PROVIDER_ID || name == "app_agg_001"
+}
+
+/// Document reduced to the keys ModelBridge writes: `model_provider`, `model`,
+/// `model_catalog_json`, and `[model_providers.custom]` / `app_agg_001`.
+fn managed_canonical(text: &str) -> Result<String, CodexError> {
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    let mut doc = text.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+    let keys: Vec<String> = doc.iter().map(|(key, _)| key.to_string()).collect();
+    for key in keys {
+        if key == "model_provider" || key == "model" || key == "model_catalog_json" {
+            continue;
+        }
+        if key == "model_providers" {
+            if let Some(table) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+                let subkeys: Vec<String> = table.iter().map(|(key, _)| key.to_string()).collect();
+                for subkey in subkeys {
+                    if !is_managed_provider(&subkey) {
+                        table.remove(&subkey);
+                    }
+                }
+            }
+            continue;
+        }
+        if doc.get(&key).is_some_and(is_toml_table) {
+            doc.remove(&key);
+        }
+    }
+    Ok(doc.to_string())
+}
+
+fn parse_doc(text: &str) -> Result<DocumentMut, CodexError> {
+    if text.is_empty() {
+        return Ok(DocumentMut::new());
+    }
+    text.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))
+}
+
+/// Keep the pre-ModelBridge document and overlay tables this tool does not own.
+fn merge_foreign_tables(baseline: &str, current: &str) -> Result<String, CodexError> {
+    let mut base = parse_doc(baseline)?;
+    let cur = parse_doc(current)?;
+    let keys: Vec<String> = cur.iter().map(|(key, _)| key.to_string()).collect();
+    for key in keys {
+        if key == "model_providers" || key == "model_provider" || key == "model" || key == "model_catalog_json" {
+            continue;
+        }
+        if cur.get(&key).is_some_and(is_toml_table) {
+            if let Some(item) = cur.get(&key).cloned() {
+                base.insert(&key, item);
+            }
+        }
+    }
+    if let Some(providers) = cur.get("model_providers").and_then(Item::as_table) {
+        let foreign: Vec<(String, Item)> = providers
+            .iter()
+            .filter(|(key, _)| !is_managed_provider(key))
+            .map(|(key, item)| (key.to_string(), item.clone()))
+            .collect();
+        if !foreign.is_empty() {
+            let dest = nested_table(base.as_table_mut(), "model_providers")?;
+            for (key, item) in foreign {
+                dest.insert(&key, item);
+            }
+        }
+    }
+    Ok(base.to_string())
+}
+
+fn local_backup_name(name: &str) -> Result<(), CodexError> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(CodexError::Message("backup name is not local".into()));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -820,16 +915,23 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
     let ownership_path = ownership_path(&req.config_path);
     let previous = read_ownership(&ownership_path)?;
     let generation = previous.as_ref().map(|o| o.generation + 1).unwrap_or(1);
-    let backup_name = if existed {
+    let latest_backup = if existed {
         let name = format!(
             "{}.{generation}.model-bridge.bak",
             file_name(&req.config_path)?
         );
-        let backup_path = parent.join(&name);
-        fs::copy(&req.config_path, &backup_path).map_err(|e| CodexError::Message(e.to_string()))?;
+        fs::copy(&req.config_path, parent.join(&name)).map_err(|e| CodexError::Message(e.to_string()))?;
         Some(name)
     } else {
         None
+    };
+    let origin = if let Some(previous) = &previous {
+        previous.origin.clone().unwrap_or(ConfigOrigin {
+            created: previous.created,
+            backup: previous.backup.clone(),
+        })
+    } else {
+        ConfigOrigin { created: !existed, backup: latest_backup.clone() }
     };
     atomic_write(&req.config_path, after.as_bytes())?;
     let ownership = Ownership {
@@ -837,9 +939,11 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
         generation,
         sha256: crate::pin::sha256_bytes(after.as_bytes()),
         managed_provider_id: PROVIDER_ID.into(),
-        backup: backup_name,
-        created: !existed,
+        backup: latest_backup.or_else(|| origin.backup.clone()),
+        created: origin.created,
         sha256_without_model: Some(hash_without_model(&after)?),
+        origin: Some(origin),
+        sha256_managed: Some(crate::pin::sha256_bytes(managed_canonical(&after)?.as_bytes())),
     };
     let body = serde_json::to_vec_pretty(&ownership).map_err(|e| CodexError::Message(e.to_string()))?;
     atomic_write(&ownership_path, &body)?;
@@ -854,21 +958,38 @@ pub fn rollback_config(config_path: &Path) -> Result<(), CodexError> {
     let ownership_path = ownership_path(config_path);
     let ownership = read_ownership(&ownership_path)?.ok_or(CodexError::NothingToRollBack)?;
     let current = fs::read(config_path).map_err(|e| CodexError::Message(e.to_string()))?;
-    if crate::pin::sha256_bytes(&current) != ownership.sha256 {
+    let full_match = crate::pin::sha256_bytes(&current) == ownership.sha256;
+    let current_text = std::str::from_utf8(&current).map_err(|_| CodexError::RollbackConflict)?;
+    let managed_match = match &ownership.sha256_managed {
+        Some(expected) => crate::pin::sha256_bytes(managed_canonical(current_text)?.as_bytes()) == *expected,
+        None => false,
+    };
+    if !full_match && !managed_match {
         return Err(CodexError::RollbackConflict);
     }
     let parent = config_path.parent().ok_or(CodexError::ParentMissing)?;
-    if let Some(backup_name) = &ownership.backup {
-        if backup_name.contains('/') || backup_name.contains("..") {
-            return Err(CodexError::Message("backup name is not local".into()));
-        }
-        let backup_path = parent.join(backup_name);
-        let bytes = fs::read(&backup_path).map_err(|e| CodexError::Message(e.to_string()))?;
-        atomic_write(config_path, &bytes)?;
-    } else if ownership.created {
-        fs::remove_file(config_path).map_err(|e| CodexError::Message(e.to_string()))?;
+    let origin = ownership.origin.clone().unwrap_or(ConfigOrigin {
+        created: ownership.created,
+        backup: ownership.backup.clone(),
+    });
+    let baseline = if let Some(backup_name) = &origin.backup {
+        local_backup_name(backup_name)?;
+        fs::read(parent.join(backup_name)).map_err(|e| CodexError::Message(e.to_string()))?
+    } else if origin.created {
+        Vec::new()
     } else {
         return Err(CodexError::NothingToRollBack);
+    };
+    let restored = if full_match {
+        baseline
+    } else {
+        let baseline_text = std::str::from_utf8(&baseline).map_err(|_| CodexError::Message("backup is not utf-8".into()))?;
+        merge_foreign_tables(baseline_text, current_text)?.into_bytes()
+    };
+    if restored.iter().all(u8::is_ascii_whitespace) && origin.created && origin.backup.is_none() {
+        fs::remove_file(config_path).map_err(|e| CodexError::Message(e.to_string()))?;
+    } else {
+        atomic_write(config_path, &restored)?;
     }
     fs::remove_file(&ownership_path).map_err(|e| CodexError::Message(e.to_string()))?;
     if let Some(parent) = config_path.parent() {
@@ -1183,6 +1304,106 @@ mod tests {
         assert_eq!(fs::read_to_string(&auth2).unwrap(), "original-auth");
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    fn append_project_trust(path: &Path, project: &str) {
+        let mut text = fs::read_to_string(path).unwrap();
+        text.push_str(&format!("\n[projects.\"{project}\"]\ntrust_level = \"trusted\"\n"));
+        fs::write(path, text).unwrap();
+    }
+
+    fn project_trust<'a>(doc: &'a DocumentMut, project: &str) -> Option<&'a str> {
+        doc.get("projects")?.get(project)?.get("trust_level")?.as_str()
+    }
+
+    #[test]
+    fn rollback_keeps_codex_project_trust_across_two_applies_that_created_the_file() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let project = dir.display().to_string();
+        let mut apply = req(&dir, Some("gemini-3-flash"));
+        apply_config(&apply).unwrap();
+        apply.model = Some("gpt-6-sol".into());
+        apply_config(&apply).unwrap();
+        let owner = read_ownership(&ownership_path(&path)).unwrap().unwrap();
+        assert_eq!(owner.generation, 2);
+        assert_eq!(owner.origin.as_ref().map(|origin| origin.created), Some(true));
+        assert!(owner.origin.as_ref().unwrap().backup.is_none());
+        append_project_trust(&path, &project);
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(before.contains("gpt-6-sol"));
+        rollback_config(&path).unwrap();
+        let restored = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        assert!(restored.get("model").is_none());
+        assert!(restored.get("model_provider").is_none());
+        assert!(restored.get("model_providers").is_none());
+        assert_eq!(project_trust(&restored, &project), Some("trusted"));
+        assert!(!ownership_path(&path).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_of_a_file_we_created_removes_it_after_a_later_apply() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        apply_config(&req(&dir, Some("gemini-3-flash"))).unwrap();
+        apply_config(&req(&dir, Some("gpt-6-sol"))).unwrap();
+        assert_eq!(read_ownership(&ownership_path(&path)).unwrap().unwrap().generation, 2);
+        rollback_config(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!ownership_path(&path).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_two_applies_restore_pre_bridge_file_and_keep_project_trust() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let project = dir.display().to_string();
+        fs::write(&path, "personality = \"keep\"\n").unwrap();
+        let mut apply = req(&dir, Some("gemini-3-flash"));
+        apply_config(&apply).unwrap();
+        apply.model = Some("gpt-6-sol".into());
+        apply_config(&apply).unwrap();
+        let owner = read_ownership(&ownership_path(&path)).unwrap().unwrap();
+        assert_eq!(owner.generation, 2);
+        assert_eq!(
+            owner.origin.as_ref().and_then(|origin| origin.backup.as_deref()),
+            Some("config.toml.1.model-bridge.bak")
+        );
+        append_project_trust(&path, &project);
+        rollback_config(&path).unwrap();
+        let restored = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        assert_eq!(restored["personality"].as_str(), Some("keep"));
+        assert!(restored.get("model").is_none());
+        assert!(restored.get("model_provider").is_none());
+        assert!(restored.get("model_providers").is_none());
+        assert_eq!(project_trust(&restored, &project), Some("trusted"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_refuses_when_a_managed_field_changes_beside_project_trust() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        let project = dir.display().to_string();
+        apply_config(&req(&dir, Some("gemini-3-flash"))).unwrap();
+        append_project_trust(&path, &project);
+        let mut doc = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        doc["model"] = toml_edit::value("gpt-6-sol");
+        fs::write(&path, doc.to_string()).unwrap();
+        let changed = fs::read_to_string(&path).unwrap();
+        assert_eq!(rollback_config(&path).unwrap_err(), CodexError::RollbackConflict);
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+
+        fs::write(&path, changed.replace("gpt-6-sol", "gemini-3-flash")).unwrap();
+        let mut doc = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        doc["model_providers"]["custom"]["base_url"] = toml_edit::value("http://127.0.0.1:9/v1");
+        fs::write(&path, doc.to_string()).unwrap();
+        let changed = fs::read_to_string(&path).unwrap();
+        assert_eq!(rollback_config(&path).unwrap_err(), CodexError::RollbackConflict);
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
