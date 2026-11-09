@@ -35,6 +35,16 @@
 
 閘道的 OAuth 權杖只留在 `.handoff/app-data/runtime/auth`。預設的啟動、套用與 `--daemon` 不讀寫 `auth.json`。登入隔離要先預覽再確認，而且不會把 refresh token 複製到另一個客戶端。
 
+## 離線 rollback selftest
+
+`scripts/macos-rollback-selftest.sh` 用 bash 載入這支交接腳本的隔離檢查，在 `.handoff/` 底下的暫存 `CODEX_HOME` 做兩次套用。它不啟動閘道，也不做 OAuth。`CODEX_HOME` 若解析到 `.handoff` 外面，腳本直接退出。從任何工作目錄都可以呼叫：
+
+```sh
+bash scripts/macos-rollback-selftest.sh
+```
+
+第一例追加 `[projects."/tmp/x"] trust_level = "trusted"` 再還原，`config.toml` 必須留下且只含那張表。第二例沒有外來表，還原後檔案必須消失。每例印 `PASS` 或 `FAIL`，任一失敗則退出碼非 0。不要用 zsh source 交接腳本。
+
 ## 命令
 
 在倉庫根目錄：

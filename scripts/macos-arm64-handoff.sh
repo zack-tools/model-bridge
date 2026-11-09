@@ -2,6 +2,10 @@
 # Apple Silicon acceptance handoff.
 # Every command forces CODEX_HOME, HOME, and the app-data directory under
 # this working copy and exits if that isolation is not in effect.
+if [ -z "${BASH_VERSION-}" ]; then
+  echo "macos-arm64-handoff.sh: this file must run under bash. From zsh, run: bash scripts/macos-arm64-handoff.sh <command>. Do not source it." >&2
+  return 1 2>/dev/null || exit 1
+fi
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
