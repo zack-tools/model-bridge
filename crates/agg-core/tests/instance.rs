@@ -2,6 +2,22 @@ use agg_core::instance;
 use std::{process::Command, time::{SystemTime, UNIX_EPOCH}};
 
 #[test]
+fn local_keys_must_be_saved_and_invalid_files_are_preserved() {
+    let dir = std::env::temp_dir().join(format!("agg-keys-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = instance::ensure_local_keys(&dir).unwrap();
+    assert_eq!(instance::ensure_local_keys(&dir).unwrap(), keys);
+    let path = dir.join("local_keys.json");
+    std::fs::write(&path, "invalid").unwrap();
+    assert!(instance::ensure_local_keys(&dir).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(instance::ensure_local_keys(&dir).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn instance_lock_across_processes() {
     if let Ok(path) = std::env::var("APP_AGG_TEST_LOCK") {
         assert!(instance::acquire(path.as_ref()).is_err(), "second process acquired a held lock");

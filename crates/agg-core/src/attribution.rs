@@ -4,6 +4,28 @@ use crate::{http, redact::Redactor, registry::SourceKind};
 use serde_json::Value;
 use std::time::Duration;
 
+/// Refuse a new login when any credential for this provider already exists.
+pub fn ensure_provider_slot_empty(port: u16, key: &str, source: SourceKind) -> Result<(), String> {
+    let bearer = format!("Bearer {key}");
+    let redactor = Redactor::new([key.to_string()]);
+    let response = http::exchange(port, "GET", "/v8/management/credentials", &[("Authorization", &bearer)], Duration::from_secs(20), &redactor)
+        .map_err(|e| format!("無法檢查既有帳號：{e}"))?;
+    if response.status != 200 { return Err("無法檢查既有帳號；未開始授權".into()); }
+    ensure_slot_empty(&response.body, source)
+}
+
+fn ensure_slot_empty(body: &str, source: SourceKind) -> Result<(), String> {
+    let value: Value = serde_json::from_str(body).map_err(|_| "帳號清單格式錯誤；未開始授權")?;
+    let files = value.get("files").and_then(Value::as_array).ok_or("帳號清單不完整；未開始授權")?;
+    let provider = match source { SourceKind::ChatGptCodex => "codex", SourceKind::Antigravity => "antigravity" };
+    for entry in files {
+        let kind = entry.get("provider").or_else(|| entry.get("type")).and_then(Value::as_str)
+            .ok_or("帳號類型不明；未開始授權")?;
+        if kind == provider { return Err("此類型已有本機憑證；暫不開放再次授權或新增同類帳號".into()); }
+    }
+    Ok(())
+}
+
 pub fn source_for_index(port: u16, management_key: &str, index: &str) -> Result<SourceKind, String> {
     if index.len() != 16 || !index.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("不支援的憑證索引格式（需為 16 位 16 進位）".into());
@@ -124,6 +146,14 @@ fn parse_source(body: &str, index: &str) -> Result<SourceKind, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_login_is_blocked_when_provider_has_any_credential() {
+        assert!(ensure_slot_empty(r#"{"files":[]}"#, SourceKind::ChatGptCodex).is_ok());
+        assert!(ensure_slot_empty(r#"{"files":[{"provider":"antigravity"}]}"#, SourceKind::ChatGptCodex).is_ok());
+        assert!(ensure_slot_empty(r#"{"files":[{"provider":"codex","disabled":true}]}"#, SourceKind::ChatGptCodex).is_err());
+        assert!(ensure_slot_empty(r#"{"files":[{}]}"#, SourceKind::ChatGptCodex).is_err());
+        assert!(ensure_slot_empty("{}", SourceKind::ChatGptCodex).is_err());
+    }
     #[test]
     fn selecting_account_requires_a_unique_active_provider() {
         let active = serde_json::json!({"auth_index":"0123456789abcdef","provider":"codex","disabled":false,"unavailable":false});

@@ -174,14 +174,17 @@ pub fn default_app_data_dir() -> Result<PathBuf, String> {
 /// 確保本機存取金鑰與管理金鑰存在（0600 權限保存）
 pub fn ensure_local_keys(dir: &Path) -> Result<(String, String), String> {
     let key_file = dir.join("local_keys.json");
-    if key_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&key_file) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let (Some(gw), Some(mgmt)) = (val["gateway_key"].as_str(), val["management_key"].as_str()) {
-                    return Ok((gw.to_string(), mgmt.to_string()));
-                }
-            }
+    match std::fs::read_to_string(&key_file) {
+        Ok(content) => {
+            let val: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|_| "本機金鑰檔格式錯誤；保留原檔".to_string())?;
+            let valid = |key: &str| key.len() >= 16 && key.bytes().all(|b| b.is_ascii_alphanumeric());
+            let gw = val["gateway_key"].as_str().filter(|s| valid(s)).ok_or("閘道金鑰無效；保留原檔")?;
+            let mgmt = val["management_key"].as_str().filter(|s| valid(s)).ok_or("管理金鑰無效；保留原檔")?;
+            return Ok((gw.to_string(), mgmt.to_string()));
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("無法讀取本機金鑰；保留原檔：{err}")),
     }
     let mut random = [0u8; 64];
     getrandom::getrandom(&mut random).map_err(|_| "無法產生本機密鑰")?;
@@ -191,13 +194,18 @@ pub fn ensure_local_keys(dir: &Path) -> Result<(String, String), String> {
         "gateway_key": gateway_key,
         "management_key": management_key,
     });
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(&key_file, serde_json::to_string_pretty(&val).unwrap_or_default());
+    std::fs::create_dir_all(dir).map_err(|e| format!("無法建立金鑰目錄：{e}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&key_file).map_err(|e| format!("無法建立本機金鑰檔：{e}"))?;
+    let content = serde_json::to_vec_pretty(&val).map_err(|e| e.to_string())?;
+    file.write_all(&content).and_then(|_| file.sync_all())
+        .map_err(|e| format!("無法保存本機金鑰；請檢查金鑰檔：{e}"))?;
     Ok((gateway_key, management_key))
 }
 

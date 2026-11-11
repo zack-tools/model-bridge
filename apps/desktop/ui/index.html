@@ -486,6 +486,7 @@
       }
       .confirm-dialog p { margin: 0 0 0.5rem; font-size: 0.83rem; color: #991b1b; font-weight: 600; }
     </style>
+    <link rel="stylesheet" href="./dashboard.css" />
   </head>
   <body>
     <!-- 頂部應用導覽列 -->
@@ -493,8 +494,8 @@
       <div class="header-brand">
         <div class="app-icon">MB</div>
         <div class="app-titles">
-          <h1>ModelBridge 本機 AI 聚合閘道</h1>
-          <p class="subtitle">跨工具通用 AI 橋樑 • 支援多客戶端模型自由切換 • 供應商：Custom</p>
+          <h1>ModelBridge</h1>
+          <p class="subtitle">本機 AI 閘道管理中心</p>
         </div>
       </div>
       <div class="header-status">
@@ -506,34 +507,46 @@
     </header>
 
     <main>
+      <div class="page-heading">
+        <div><p class="eyebrow">LOCAL AI GATEWAY</p><h2>閘道總覽</h2><p>管理連線、帳號授權與模型設定。</p></div>
+        <span class="local-badge"><span aria-hidden="true">●</span> 本機管理</span>
+      </div>
+      <nav class="section-nav" aria-label="功能分頁" role="tablist">
+        <button type="button" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true">總覽</button>
+        <button type="button" role="tab" id="tab-accounts" aria-controls="panel-accounts" aria-selected="false" tabindex="-1">帳號管理</button>
+        <button type="button" role="tab" id="tab-models" aria-controls="panel-models" aria-selected="false" tabindex="-1">模型管理</button>
+        <button type="button" role="tab" id="tab-integration" aria-controls="panel-integration" aria-selected="false" tabindex="-1">客戶端整合</button>
+        <button type="button" role="tab" id="tab-activity" aria-controls="panel-activity" aria-selected="false" tabindex="-1">日誌與設定</button>
+      </nav>
+      <div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
       <!-- 頂部智慧概覽指標 (Dashboard Metrics) -->
       <div class="metrics-grid">
         <div class="metric-card">
           <div class="metric-label">聚合閘道端點</div>
-          <div class="metric-value" id="metric-port">127.0.0.1:50833</div>
-          <div class="metric-hint" id="metric-status-hint">監聽本機 Loopback</div>
+          <div class="metric-value" id="metric-port">檢查中</div>
+          <div class="metric-hint" id="metric-status-hint">正在檢查閘道狀態</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">ChatGPT 官方整合</div>
-          <div class="metric-value" id="metric-desktop" style="color: #10b981;">Custom</div>
+          <div class="metric-label">ChatGPT Desktop 整合</div>
+          <div class="metric-value" id="metric-desktop">檢查中</div>
           <div class="metric-hint" id="metric-desktop-hint">閘道使用自己的 OAuth</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">有效帳號數</div>
-          <div class="metric-value" id="metric-accounts">2 個帳號</div>
-          <div class="metric-hint">ChatGPT Plus & Antigravity</div>
+          <div class="metric-label">帳號狀態</div>
+          <div class="metric-value" id="metric-accounts">未確認</div>
+          <div class="metric-hint">請查看下方帳號授權狀態</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">可用聚合模型</div>
-          <div class="metric-value" id="metric-models">16 款模型</div>
-          <div class="metric-hint">支援 GPT 與 Gemini 雙系列</div>
+          <div class="metric-label">目前查詢的模型</div>
+          <div class="metric-value" id="metric-models">尚未查詢</div>
+          <div class="metric-hint">顯示所選帳號來源的查詢數量</div>
         </div>
       </div>
 
       <!-- 核心區塊 1: 閘道控制中心 -->
-      <section class="card-section">
+      <section id="gateway-control" class="card-section">
         <div class="card-section-header">
-          <h2>⚡️ 閘道控制中心</h2>
+          <h2>閘道控制</h2>
           <div style="display:flex; gap:0.4rem;">
             <button id="start" type="button" class="btn-primary" disabled>啟動閘道</button>
             <button id="stop" type="button" class="btn-danger" disabled>停止閘道</button>
@@ -543,7 +556,7 @@
 
         <!-- 停止確認對話方塊 -->
         <div id="stop-confirmation" class="confirm-dialog" hidden>
-          <p>⚠️ 確定停止本機聚合閘道？（本地保存之登入憑證將 100% 完整保留於本機，下次啟動自動恢復）</p>
+          <p>確定停止閘道？本機憑證會保留，但登入確認狀態不會保留。</p>
           <div style="display:flex; gap:0.4rem;">
             <button id="stop-confirm" type="button" class="btn-danger">確定停止</button>
             <button id="stop-cancel" type="button">取消</button>
@@ -551,38 +564,29 @@
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-top:0.6rem;">
-          <label class="checkbox-label">
-            <input id="retain-gateway" type="checkbox" checked>
-            <strong>關閉視窗時保留閘道背景運行</strong>（確保 ChatGPT Desktop / VS Code 不斷線）
-          </label>
           <div style="display:flex; gap:0.4rem;">
             <button id="inspect" type="button" style="font-size:0.78rem;">檢查啟動保護紀錄</button>
             <button id="clear-guard" type="button" style="display:none; font-size:0.78rem;" class="btn-danger">清除保護紀錄</button>
           </div>
         </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-top:0.5rem; padding-top:0.5rem; border-top:1px dashed var(--border-color);">
-          <label class="checkbox-label">
-            <input id="autostart-gateway" type="checkbox">
-            <strong>開機自動在背景啟動閘道</strong>（直接連線，不啟動 UI 視窗）
-          </label>
-          <span id="autostart-status" class="field-note" style="margin:0;">檢查中…</span>
-        </div>
         <p id="inspection" class="field-note" role="status" aria-live="polite"></p>
       </section>
 
+      </div>
+      <div id="panel-integration" role="tabpanel" aria-labelledby="tab-integration" tabindex="0" hidden>
       <!-- 核心區塊 2: ChatGPT Desktop 整合設定 -->
       <section id="codex-config-section" class="card-section">
         <div class="card-section-header">
-          <h2>💻 ChatGPT Desktop 整合設定 (Custom 提供者)</h2>
+          <h2>ChatGPT Desktop 整合</h2>
         </div>
 
         <!-- 一鍵最佳化整合按鈕 -->
         <div class="quick-setup-box">
           <div class="quick-setup-text">
-            <h3>🚀 一鍵設定 ChatGPT Desktop</h3>
+            <h3>快速設定用戶端</h3>
             <p>同步模型清單目錄 (model_catalog) 並套用 Custom 閘道端點。不會讀寫 Codex 的登入檔。</p>
           </div>
-          <button id="one-click-setup-btn" type="button" class="btn-highlight">⚡️ 一鍵套用閘道</button>
+          <button id="one-click-setup-btn" type="button" class="btn-highlight">一鍵套用閘道</button>
         </div>
 
         <div class="form-group">
@@ -626,14 +630,25 @@
         </div>
       </section>
 
+      </div>
+      <div id="panel-accounts" role="tabpanel" aria-labelledby="tab-accounts" tabindex="0" hidden>
       <!-- 核心區塊 3: 帳號授權中心 -->
-      <section class="card-section">
+      <section id="accounts" class="card-section">
         <div class="card-section-header">
-          <h2>🔐 帳號授權管理（本機安全持久留存）</h2>
+          <h2>帳號授權</h2>
         </div>
         <p class="section-desc">
-          登入憑證僅保存在本地私有目錄（0700），停止閘道完整保留，絕不上傳雲端。
+          每種類型目前僅提供一個授權位置。若本機已有該類憑證，目前會暫停再次授權，以避免新增同類帳號；重新啟動後的安全重新確認功能尚未支援。
         </p>
+
+        <div class="account-add">
+          <label for="account-type">帳號類型</label>
+          <select id="account-type">
+            <option value="codex">ChatGPT / Codex（GPT）</option>
+            <option value="antigravity">Antigravity（Gemini）</option>
+          </select>
+          <button id="add-account" type="button" class="btn-primary">開始授權</button>
+        </div>
 
         <div style="margin-bottom: 0.85rem;">
           <label class="checkbox-label">
@@ -642,18 +657,18 @@
           </label>
         </div>
 
-        <div class="accounts-grid">
+        <div class="accounts-grid" aria-label="帳號類型與授權狀態">
           <!-- ChatGPT / Codex -->
           <div class="account-card account" data-provider="codex">
             <div>
               <div class="account-header">
                 <h3>ChatGPT / Codex</h3>
-                <span class="account-badge">Plus 方案</span>
+                <span class="account-badge">ChatGPT / Codex</span>
               </div>
-              <p role="status" aria-live="polite">已從本機保存憑證確認登入 (已驗證)</p>
+              <p role="status" aria-live="polite">登入狀態尚未確認</p>
             </div>
             <div class="account-actions">
-              <button data-action="begin" class="btn-primary">瀏覽器登入</button>
+              <button data-action="begin" class="btn-primary" hidden>瀏覽器登入</button>
               <button data-action="poll">檢查狀態</button>
               <button data-action="confirm" class="btn-success">確認完成</button>
               <button data-action="cancel" class="btn-danger">取消</button>
@@ -667,10 +682,10 @@
                 <h3>Antigravity</h3>
                 <span class="account-badge" style="background:rgba(124,58,237,0.12); color:#7c3aed;">Google Gemini</span>
               </div>
-              <p role="status" aria-live="polite">已從本機保存憑證確認登入 (已驗證)</p>
+              <p role="status" aria-live="polite">登入狀態尚未確認</p>
             </div>
             <div class="account-actions">
-              <button data-action="begin" class="btn-primary">瀏覽器登入</button>
+              <button data-action="begin" class="btn-primary" hidden>瀏覽器登入</button>
               <button data-action="poll">檢查狀態</button>
               <button data-action="confirm" class="btn-success">確認完成</button>
               <button data-action="cancel" class="btn-danger">取消</button>
@@ -679,10 +694,12 @@
         </div>
       </section>
 
+      </div>
+      <div id="panel-models" role="tabpanel" aria-labelledby="tab-models" tabindex="0" hidden>
       <!-- 核心區塊 4: 模型發現與 Gate 3 驗收探針 -->
-      <section class="card-section">
+      <section id="models" class="card-section">
         <div class="card-section-header">
-          <h2>🧪 聚合模型清單與 Gate 3 回合驗證</h2>
+          <h2>模型清單與驗證</h2>
         </div>
         <p class="section-desc">向本機閘道查詢已認證帳號所帶出之模型，並可對特定模型執行真實串流雙回合工具調用驗證。</p>
 
@@ -704,7 +721,7 @@
             🎯 Gate 3 真實雙向串流與工具回合驗收探針
           </div>
           <p style="font-size:0.78rem; color:var(--text-secondary); margin:0 0 0.6rem;">
-            向所選模型發送即時串流並核驗隨機 Nonce 挑戰與帳號 Trace ID。<strong>此操作將向官方發送真實請求並消耗額度</strong>。
+            向所選模型發送串流請求，驗證工具呼叫及帳號來源。<strong>此操作將發送真實請求並消耗額度</strong>。
           </p>
           <div style="margin-bottom:0.6rem;">
             <label class="checkbox-label">
@@ -722,8 +739,15 @@
         </div>
       </section>
 
+      </div>
+      <div id="panel-activity" role="tabpanel" aria-labelledby="tab-activity" tabindex="0" hidden>
+      <section class="card-section">
+        <div class="card-section-header"><h2>啟動設定</h2></div>
+        <p><label class="checkbox-label"><input id="retain-gateway" type="checkbox" checked><strong>關閉視窗時保留閘道背景運行</strong></label></p>
+        <p><label class="checkbox-label"><input id="autostart-gateway" type="checkbox"><strong>開機自動在背景啟動閘道</strong></label> <span id="autostart-status" class="field-note">檢查中…</span></p>
+      </section>
       <!-- 核心區塊 5: 系統即時執行與驗收日誌 -->
-      <section class="card-section" style="padding:0; overflow:hidden; border:none; background:transparent;">
+      <section id="activity" class="card-section" style="padding:0; overflow:hidden; border:none; background:transparent;">
         <div class="terminal-box">
           <div class="terminal-header">
             <div style="display:flex; align-items:center; gap:0.6rem;">
@@ -742,6 +766,7 @@
           <pre id="activity-log"></pre>
         </div>
       </section>
+      </div>
     </main>
 
     <script src="./gateway.js"></script>

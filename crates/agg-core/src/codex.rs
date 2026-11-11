@@ -121,25 +121,12 @@ pub struct CatalogSyncSummary {
 }
 
 
-fn is_cc_switch_model(entry: &serde_json::Value) -> bool {
-    let slug = entry.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-    let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
-    let comp = entry.get("comp_hash").and_then(|s| s.as_str()).unwrap_or("");
-    let display = entry.get("display_name").and_then(|s| s.as_str()).unwrap_or("");
-
-    comp == "cc-switch"
-        || slug.starts_with("ccs-")
-        || display.contains("Gemini-OAuth")
-        || display.contains("cc-switch")
-        || desc.contains("cc-switch")
-}
-
 fn is_model_bridge_model(entry: &serde_json::Value) -> bool {
     let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
     desc.starts_with("model-bridge aggregated model:")
 }
 
-/// Restore catalog by removing any non-native (ModelBridge or CC Switch) models.
+/// Remove models added by ModelBridge while preserving other catalog entries.
 pub fn restore_native_catalog(catalog_path: &Path) -> Result<bool, CodexError> {
     reject_symlink(catalog_path)?;
     if !catalog_path.exists() {
@@ -156,7 +143,7 @@ pub fn restore_native_catalog(catalog_path: &Path) -> Result<bool, CodexError> {
 
     let before_len = models_arr.len();
     models_arr.retain(|entry| {
-        !is_cc_switch_model(entry) && !is_model_bridge_model(entry)
+        !is_model_bridge_model(entry)
     });
 
     if models_arr.len() != before_len {
@@ -282,12 +269,7 @@ pub fn sync_model_catalog(
         .and_then(|v| v.as_array_mut())
         .ok_or_else(|| CodexError::Message("model_catalog.json does not contain a 'models' array".into()))?;
 
-    // 依使用者指示：徹底過濾 CC Switch 模型條目與先前加入之 model-bridge 模型
-    models_arr.retain(|entry| {
-        let slug = entry.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-        let is_image = slug.to_ascii_lowercase().contains("image");
-        !is_cc_switch_model(entry) && !is_model_bridge_model(entry) && !is_image
-    });
+    models_arr.retain(|entry| !is_model_bridge_model(entry));
 
     let mut existing_slugs = Vec::new();
     let mut added_slugs = Vec::new();
@@ -826,16 +808,31 @@ pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
     let marker = suspended_path(path);
     reject_symlink(&marker)?;
     if marker.exists() {
+        let record: SuspendedConfig = serde_json::from_slice(&fs::read(&marker).map_err(|e| CodexError::Message(e.to_string()))?)
+            .map_err(|e| CodexError::Message(e.to_string()))?;
+        let current = read_existing(path)?;
+        if current == record.active {
+            let mut doc = parse_doc(&record.active)?;
+            doc.remove("model_provider");
+            doc.remove("model_catalog_json");
+            doc.remove("model");
+            doc.remove("model_reasoning_effort");
+            let native = doc.to_string();
+            if crate::pin::sha256_bytes(native.as_bytes()) != record.native_hash { return Err(CodexError::ExternalEdit); }
+            atomic_write(path, native.as_bytes())?;
+        } else if crate::pin::sha256_bytes(current.as_bytes()) != record.native_hash {
+            return Err(CodexError::ExternalEdit);
+        }
         if let Some(parent) = path.parent() {
             let cat_path = parent.join("model_catalog.json");
-            let _ = restore_native_catalog(&cat_path);
+            restore_native_catalog(&cat_path)?;
         }
         return Ok(true);
     }
     let Some(mut owner) = read_ownership(&ownership_path(path))? else {
         if let Some(parent) = path.parent() {
             let cat_path = parent.join("model_catalog.json");
-            let _ = restore_native_catalog(&cat_path);
+            restore_native_catalog(&cat_path)?;
         }
         return Ok(false);
     };
@@ -870,7 +867,7 @@ pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
 
     if let Some(parent) = path.parent() {
         let cat_path = parent.join("model_catalog.json");
-        let _ = restore_native_catalog(&cat_path);
+        restore_native_catalog(&cat_path)?;
     }
 
     Ok(true)
@@ -1696,7 +1693,7 @@ mod tests {
 
 
     #[test]
-    fn syncs_model_catalog_filters_cc_switch_and_restores_native() {
+    fn sync_and_restore_preserve_cc_switch_models() {
         let dir = scratch();
         let cat_path = dir.join("model_catalog.json");
         let initial = serde_json::json!({
@@ -1722,24 +1719,26 @@ mod tests {
             "gemini-3.8-flash-high".to_string(),
         ];
         let summary = sync_model_catalog(&cat_path, &models).unwrap();
-        assert_eq!(summary.total_models, 2);
+        assert_eq!(summary.total_models, 3);
         assert_eq!(summary.added_slugs, vec!["gemini-3.8-flash-high"]);
 
         let content = fs::read_to_string(&cat_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let arr = parsed["models"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["slug"], "gpt-6-astra");
-        assert_eq!(arr[1]["slug"], "gemini-3.8-flash-high");
-        assert!(arr[1].get("comp_hash").is_none());
+        assert_eq!(arr[1]["slug"], "ccs-gemini/gemini-3.7-flash");
+        assert_eq!(arr[2]["slug"], "gemini-3.8-flash-high");
+        assert!(arr[2].get("comp_hash").is_none());
 
         // Test restore_native_catalog
         assert!(restore_native_catalog(&cat_path).unwrap());
         let restored_content = fs::read_to_string(&cat_path).unwrap();
         let restored: serde_json::Value = serde_json::from_str(&restored_content).unwrap();
         let restored_arr = restored["models"].as_array().unwrap();
-        assert_eq!(restored_arr.len(), 1);
+        assert_eq!(restored_arr.len(), 2);
         assert_eq!(restored_arr[0]["slug"], "gpt-6-astra");
+        assert_eq!(restored_arr[1]["slug"], "ccs-gemini/gemini-3.7-flash");
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1771,6 +1770,23 @@ mod tests {
         assert_eq!(doc["model"].as_str(), Some("user-selected-model"));
         assert_eq!(doc["model_providers"]["custom"]["base_url"].as_str(), Some("http://127.0.0.1:50834/v1"));
         assert!(!resume_config(&path, 50834, "localgateway012345").unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn suspend_recovers_interrupted_write_without_overwriting_edits() {
+        let dir = scratch();
+        let req = req(&dir, Some("gateway-model"));
+        apply_config(&req).unwrap();
+        let active = fs::read_to_string(&req.config_path).unwrap();
+        assert!(suspend_config(&req.config_path).unwrap());
+        let native = fs::read_to_string(&req.config_path).unwrap();
+        fs::write(&req.config_path, &active).unwrap();
+        assert!(suspend_config(&req.config_path).unwrap());
+        assert_eq!(fs::read_to_string(&req.config_path).unwrap(), native);
+        fs::write(&req.config_path, "external = true\n").unwrap();
+        assert_eq!(suspend_config(&req.config_path).unwrap_err(), CodexError::ExternalEdit);
+        assert_eq!(fs::read_to_string(&req.config_path).unwrap(), "external = true\n");
         let _ = fs::remove_dir_all(dir);
     }
 

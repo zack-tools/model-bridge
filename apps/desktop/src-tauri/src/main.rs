@@ -151,19 +151,6 @@ async fn start_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Resul
                 gateway.management_key = Some(management_key.clone());
                 gateway.gateway_key = Some(gateway_key);
 
-                // 自動從本地保存之憑證恢復 session
-                if let Ok(_index) = attribution::single_active_index(port, &management_key, SourceKind::ChatGptCodex) {
-                    let mut client = OAuthClient::new(port, management_key.clone(), Provider::ChatGptCodex);
-                    client.session.state = AuthState::Authenticated;
-                    client.session.live = true;
-                    gateway.codex = Some(client);
-                }
-                if let Ok(_index) = attribution::single_active_index(port, &management_key, SourceKind::Antigravity) {
-                    let mut client = OAuthClient::new(port, management_key.clone(), Provider::Antigravity);
-                    client.session.state = AuthState::Authenticated;
-                    client.session.live = true;
-                    gateway.antigravity = Some(client);
-                }
                 if let Some(pid) = child_pid {
                     let _ = std::fs::write(lock_dir.join("gateway.pid"), pid.to_string());
                 }
@@ -193,38 +180,9 @@ async fn stop_gateway(app: tauri::AppHandle, state: State<'_, Shared>) -> Result
         if gw.process.is_some() {
             gw.stop()?;
         } else {
-            // 終止背景自啟或孤立的核心程序
-            let pid_file = lock_dir.join("gateway.pid");
-            if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = pid_text.trim().parse::<u32>() {
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        const CREATE_NO_WINDOW: u32 = 0x08000000;
-                        let kill_cmd = format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue");
-                        let _ = std::process::Command::new("powershell")
-                            .creation_flags(CREATE_NO_WINDOW)
-                            .args(["-NoProfile", "-Command", &kill_cmd])
-                            .output();
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).output();
-                    }
-                }
-            }
-            let _ = std::fs::remove_file(lock_dir.join("gateway.running"));
+            return Err("此視窗無法安全控制背景程序；請先檢查舊閘道並依提示復原".into());
         }
         let _ = std::fs::remove_file(lock_dir.join("gateway.pid"));
-
-        // 停止閘道時自動還原原生設定與原生模型目錄
-        if let Ok(config_path) = codex_config_path(None) {
-            let _ = agg_core::codex::suspend_config(&config_path);
-            if let Some(parent) = config_path.parent() {
-                let cat_path = parent.join("model_catalog.json");
-                let _ = agg_core::codex::restore_native_catalog(&cat_path);
-            }
-        }
 
         Ok(())
     }).await.map_err(|_| "停止工作失敗".to_string())?
@@ -357,7 +315,7 @@ async fn gateway_status(app: tauri::AppHandle, state: State<'_, Shared>) -> Resu
 
                 // 若該埠號確實正在被監聽，表示核心健康運行中！
                 if agg_core::supervisor::ensure_port_free(port).is_err() {
-                    return Ok(serde_json::json!({"state": "healthy", "port": port}));
+                    return Ok(serde_json::json!({"state": "detached", "port": port}));
                 }
             }
             return Ok(serde_json::json!({"state": "needs_recovery"}));
@@ -407,6 +365,8 @@ async fn oauth_start(state: State<'_, Shared>, provider: String, terms: bool) ->
         let kind = match provider.as_str() { "codex" => Provider::ChatGptCodex, "antigravity" => Provider::Antigravity, _ => return Err("不支援的帳號來源".into()) };
         let slot = account_slot(&mut gateway, &provider)?;
         if slot.is_some() { return Err("此帳號流程已存在；請先取消或停止閘道".into()); }
+        let source = match provider.as_str() { "codex" => SourceKind::ChatGptCodex, _ => SourceKind::Antigravity };
+        attribution::ensure_provider_slot_empty(port, &key, source)?;
         let mut client = OAuthClient::new(port, key, kind);
         client.session.acknowledge_terms();
         let url = match client.begin() {
@@ -433,27 +393,11 @@ async fn oauth_action(state: State<'_, Shared>, provider: String, action: String
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut gateway = state.lock().map_err(|_| "閘道狀態無法讀取".to_string())?;
-        let port = gateway.process.as_ref().ok_or("請先啟動閘道")?.port;
-        let mgmt_key = gateway.management_key.clone().ok_or("閘道金鑰不可用")?;
+        gateway.process.as_ref().ok_or("請先啟動閘道")?;
         let slot = account_slot(&mut gateway, &provider)?;
         let client = match slot.as_mut() {
             Some(c) => c,
-            None => {
-                let (source, prov) = match provider.as_str() {
-                    "codex" => (SourceKind::ChatGptCodex, Provider::ChatGptCodex),
-                    "antigravity" => (SourceKind::Antigravity, Provider::Antigravity),
-                    _ => return Err("不支援的帳號來源".into()),
-                };
-                if let Ok(_index) = attribution::single_active_index(port, &mgmt_key, source) {
-                    let mut new_client = OAuthClient::new(port, mgmt_key, prov);
-                    new_client.session.state = AuthState::Authenticated;
-                    new_client.session.live = true;
-                    *slot = Some(new_client);
-                    return Ok("已從本機保存憑證確認登入 (已驗證)；停止閘道保留憑證".into());
-                } else {
-                    return Err("此帳號尚未啟動登入".into());
-                }
-            }
+            None => return Err("尚未確認登入；請重新授權".into()),
         };
         match action.as_str() {
             "poll" => match client.poll_user_present() {
@@ -622,14 +566,9 @@ async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
             if !output.status.success() { return Err("程序檢查失敗".into()); }
             let config = runtime.join("config.yaml");
             let config_str = config.to_str().ok_or("路徑無法顯示")?;
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                if line.contains("cli-proxy-api") && line.contains(config_str) {
-                    if let Some(pid_str) = line.split_whitespace().next() {
-                        let _ = std::process::Command::new("kill").args(["-TERM", pid_str]).output();
-                    }
-                }
+            if String::from_utf8_lossy(&output.stdout).lines().any(|line| line.contains("cli-proxy-api") && line.contains(config_str)) {
+                return Err("舊核心仍在執行；請先確認並手動停止後再清除紀錄".into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(300));
         }
         #[cfg(target_os = "windows")]
         {
@@ -638,40 +577,16 @@ async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
             let config = runtime.join("config.yaml");
             let config_str = config.to_str().ok_or("路徑無法顯示")?;
 
-            // 1. 若舊核心仍在執行，主動強制終止對應設定檔的 cli-proxy-api 程序
-            let _ = std::process::Command::new("powershell")
-                .creation_flags(CREATE_NO_WINDOW)
-                .env("TARGET_CONFIG", config_str)
-                .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*cli-proxy-api*' -and $_.CommandLine -and $_.CommandLine.Contains($env:TARGET_CONFIG) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"])
-                .output();
-
-            // 若有記錄 pid 檔案，也確認終止該 pid
-            let pid_file = dir.join("gateway.pid");
-            if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = pid_text.trim().parse::<u32>() {
-                    let kill_cmd = format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue");
-                    let _ = std::process::Command::new("powershell")
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .args(["-NoProfile", "-Command", &kill_cmd])
-                        .output();
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(400));
-
             // 2. 複查是否仍有殘留程序
             let output = std::process::Command::new("powershell")
                 .creation_flags(CREATE_NO_WINDOW)
                 .env("TARGET_CONFIG", config_str)
                 .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*cli-proxy-api*' -and $_.CommandLine -and $_.CommandLine.Contains($env:TARGET_CONFIG) } | ForEach-Object { $_.CommandLine }"])
                 .output().map_err(|e| format!("無法檢查程序：{e}"))?;
-            let still_running = if output.status.success() {
-                !String::from_utf8_lossy(&output.stdout).trim().is_empty()
-            } else {
-                false
-            };
+            if !output.status.success() { return Err("程序檢查失敗；保護紀錄仍保留".into()); }
+            let still_running = !String::from_utf8_lossy(&output.stdout).trim().is_empty();
             if still_running {
-                return Err("無法自動終止舊核心程序，請由工作管理員手動結束 cli-proxy-api.exe 後重試".into());
+                return Err("舊核心仍在執行；請確認後手動停止對應程序，再清除紀錄".into());
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -682,7 +597,7 @@ async fn clear_run_guard(app: tauri::AppHandle) -> Result<String, String> {
             std::fs::remove_file(&guard).map_err(|e| format!("無法移除啟動保護檔：{e}"))?;
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        Ok("已終止舊核心程序並成功清除保護紀錄；登入憑證已保留".into())
+        Ok("已確認沒有對應核心程序並清除保護紀錄；登入憑證已保留".into())
     }).await.map_err(|_| "清除工作失敗".to_string())?
 }
 
@@ -905,41 +820,12 @@ fn run_headless_daemon() {
     let lock_dir = daemon_data_dir();
     let runtime_dir = lock_dir.join("runtime");
     let guard_path = lock_dir.join("gateway.running");
-    let pid_file = lock_dir.join("gateway.pid");
-
-    // 若背景程序已在執行，直接返回
-    if guard_path.exists() {
-        if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
-            if let Ok(pid) = pid_text.trim().parse::<u32>() {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    let check_cmd = format!("Get-Process -Id {pid} -ErrorAction SilentlyContinue | Where-Object {{ $_.ProcessName -like '*cli-proxy-api*' }} | Select-Object -ExpandProperty Id");
-                    if let Ok(out) = std::process::Command::new("powershell")
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .args(["-NoProfile", "-Command", &check_cmd])
-                        .output()
-                    {
-                        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-                            return;
-                        }
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = pid;
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&guard_path);
-        let _ = std::fs::remove_file(&pid_file);
-    }
-
+    if std::fs::create_dir_all(&lock_dir).is_err() { return; }
     let _instance_lock = match instance::acquire(&lock_dir.join("gateway.lock")) {
         Ok(l) => l,
         Err(_) => return,
     };
+    if guard_path.exists() { return; }
 
     let core_dir = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from).or_else(|| {
         let mut d = std::env::current_exe().ok()?.parent()?.to_path_buf();
@@ -1052,6 +938,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn suspend_reports_catalog_failure() {
+        tauri::async_runtime::block_on(async {
+            let mut nonce = [0u8; 8];
+            getrandom::getrandom(&mut nonce).unwrap();
+            let dir = std::env::temp_dir().join(format!("agg-catalog-error-{}", pin::sha256_bytes(&nonce)));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            std::fs::write(&path, "").unwrap();
+            std::fs::write(dir.join("model_catalog.json"), "invalid json").unwrap();
+            assert!(codex_suspend(Some(path.to_string_lossy().into_owned())).await.is_err());
+            std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
+
+    #[test]
     fn persistent_runtime_is_preserved_on_stop() {
         let mut nonce = [0u8; 16];
         getrandom::getrandom(&mut nonce).unwrap();
@@ -1161,12 +1062,13 @@ mod tests {
             assert!(!cfg_str.contains("model_catalog_json ="));
             assert!(!cfg_str.contains("model ="));
 
-            // Verify model_catalog.json restored to purely native
+            // Preserve models owned by other tools.
             let cat_text = std::fs::read_to_string(&cat_path).unwrap();
             let cat_json: serde_json::Value = serde_json::from_str(&cat_text).unwrap();
             let models = cat_json["models"].as_array().unwrap();
-            assert_eq!(models.len(), 1);
+            assert_eq!(models.len(), 2);
             assert_eq!(models[0]["slug"], "gpt-6-astra");
+            assert_eq!(models[1]["slug"], "ccs-gemini/gemini-3.7-flash");
 
             let _ = std::fs::remove_dir_all(&dir);
         });

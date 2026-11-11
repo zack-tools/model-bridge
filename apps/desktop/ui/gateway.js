@@ -4,6 +4,32 @@ const stop = document.getElementById('stop');
 let generation = 0;
 let discoveryGeneration = 0;
 
+const tabs = [...document.querySelectorAll('[role="tab"]')];
+function selectTab(tab, focus = false) {
+  for (const item of tabs) {
+    const selected = item === tab;
+    item.setAttribute('aria-selected', String(selected));
+    item.tabIndex = selected ? 0 : -1;
+    document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
+  }
+  document.querySelector('.page-heading h2').textContent = tab.textContent === '總覽' ? '閘道總覽' : tab.textContent;
+  if (focus) tab.focus();
+}
+for (const tab of tabs) {
+  tab.addEventListener('click', () => selectTab(tab));
+  tab.addEventListener('keydown', event => {
+    const index = tabs.indexOf(tab);
+    let next;
+    if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+    else if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    selectTab(tabs[next], true);
+  });
+}
+
 // 頂部狀態燈與指標元素
 const pulseIndicator = document.getElementById('pulse-indicator');
 const quickStatusText = document.getElementById('quick-status-text');
@@ -60,6 +86,8 @@ if (copyLogBtn) {
 
 function resetAccounts() {
   ++discoveryGeneration;
+  if (metricAccounts) metricAccounts.textContent = '未確認';
+  if (metricModels) metricModels.textContent = '尚未查詢';
   document.getElementById('model-list').replaceChildren();
   document.getElementById('model-status').textContent = '';
   const select = document.getElementById('verify-model-select');
@@ -75,7 +103,7 @@ function resetAccounts() {
   const verifyStatus = document.getElementById('verify-status');
   if (verifyStatus) verifyStatus.textContent = '';
   for (const account of document.querySelectorAll('.account')) {
-    account.querySelector('p').textContent = '閘道已停止；本地保存之登入憑證完整保留，再次啟動可直接使用';
+    account.querySelector('p').textContent = '閘道已停止；本機憑證保留，登入狀態未確認';
   }
   appendLog('INFO', '帳號與模型清單狀態已重置');
 }
@@ -92,6 +120,17 @@ async function monitor(current, startError = null) {
       if (pulseIndicator) pulseIndicator.className = 'pulse-dot';
       if (quickStatusText) quickStatusText.textContent = '⚠️ 清理未完成';
       stop.disabled = false;
+      start.disabled = true;
+      return;
+    }
+    if (result.state === 'detached') {
+      if (clearGuardBtn) clearGuardBtn.style.display = 'inline-block';
+      status.textContent = `背景閘道仍在執行（127.0.0.1:${result.port}），此視窗無法接管。請先檢查舊閘道，手動停止對應程序後清除紀錄，再啟動閘道。`;
+      if (quickStatusText) quickStatusText.textContent = '⚠️ 需重新連接';
+      if (metricPort) metricPort.textContent = `127.0.0.1:${result.port}`;
+      if (metricStatusHint) metricStatusHint.textContent = '背景程序狀態待確認';
+      for (const account of document.querySelectorAll('.account')) account.querySelector('p').textContent = '背景閘道尚未接管，登入狀態未知';
+      stop.disabled = true;
       start.disabled = true;
       return;
     }
@@ -115,7 +154,7 @@ async function monitor(current, startError = null) {
       return;
     }
     status.textContent = result.state === 'healthy'
-      ? `閘道健康運作中：127.0.0.1:${result.port} (已自動套用至 ChatGPT Desktop Custom 提供者)`
+      ? `閘道健康運作中：127.0.0.1:${result.port}`
       : `閘道無法回應健康檢查：127.0.0.1:${result.port}`;
     if (result.state === 'healthy') {
       if (pulseIndicator) pulseIndicator.className = 'pulse-dot running';
@@ -159,7 +198,7 @@ start.addEventListener('click', async () => {
         const msg = await window.__TAURI__.core.invoke('oauth_action', { provider, action: 'poll' });
         account.querySelector('p').textContent = msg;
       } catch (_) {
-        account.querySelector('p').textContent = '尚未登入';
+        account.querySelector('p').textContent = '登入狀態未確認；已有本機憑證時暫不支援重新授權';
       }
     }
     stop.disabled = false;
@@ -238,6 +277,12 @@ if (clearGuardBtn) {
   });
 }
 
+document.getElementById('add-account').addEventListener('click', () => {
+  const provider = document.getElementById('account-type').value;
+  const account = document.querySelector(`.account[data-provider="${provider}"]`);
+  account.querySelector('[data-action="begin"]').click();
+});
+
 for (const account of document.querySelectorAll('.account')) {
   const result = account.querySelector('p');
   for (const button of account.querySelectorAll('button')) {
@@ -268,10 +313,7 @@ async function initializeGateway() {
   try {
     if (await window.__TAURI__.core.invoke('auto_start_enabled')) {
       const result = await window.__TAURI__.core.invoke('gateway_status');
-      if (result.state === 'needs_recovery') {
-        await window.__TAURI__.core.invoke('clear_run_guard');
-      }
-      if (result.state === 'stopped' || result.state === 'needs_recovery') {
+      if (result.state === 'stopped') {
         start.disabled = false;
         start.click();
         return;
@@ -286,6 +328,7 @@ initializeGateway();
 
 document.getElementById('model-provider').addEventListener('change', () => {
   ++discoveryGeneration;
+  if (metricModels) metricModels.textContent = '尚未查詢';
   document.getElementById('model-list').replaceChildren();
   document.getElementById('model-status').textContent = '';
   const select = document.getElementById('verify-model-select');
@@ -312,6 +355,7 @@ document.getElementById('discover-models').addEventListener('click', async () =>
   const verifyBtn = document.getElementById('verify-model');
   const provider = document.getElementById('model-provider').value;
   button.disabled = true;
+  if (metricModels) metricModels.textContent = '尚未查詢';
   list.replaceChildren();
   if (select) {
     select.replaceChildren();
@@ -322,7 +366,7 @@ document.getElementById('discover-models').addEventListener('click', async () =>
   }
   if (verifyBtn) verifyBtn.disabled = true;
   message.textContent = '查詢中…';
-  appendLog('INFO', `正在向閘道查詢 [${provider}] 之可用模型清單…`);
+    appendLog('INFO', `正在向閘道查詢 [${provider}] 之模型清單…`);
   try {
     const models = await window.__TAURI__.core.invoke('discovered_models', { provider });
     if (current !== generation || query !== discoveryGeneration) return;
@@ -341,14 +385,14 @@ document.getElementById('discover-models').addEventListener('click', async () =>
       item.id = `model-entry-${model.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
       const isGemini = model.startsWith('gemini');
       const badgeIcon = isGemini ? '✨' : '⚡️';
-      item.textContent = `${badgeIcon} ${model}（可用）`;
+      item.textContent = `${badgeIcon} ${model}（已發現，尚未驗證）`;
       list.appendChild(item);
     }
-    message.textContent = models.length ? `已發現 ${models.length} 個可用模型` : '目前沒有可顯示的模型';
-    if (metricModels && models.length) {
+    message.textContent = models.length ? `已發現 ${models.length} 個模型，尚未驗證` : '目前沒有可顯示的模型';
+    if (metricModels) {
       metricModels.textContent = `${models.length} 款模型`;
     }
-    appendLog('SUCCESS', `查詢 [${provider}] 模型成功，發現 ${models.length} 個可用模型`, models);
+    appendLog('SUCCESS', `查詢 [${provider}] 模型成功，發現 ${models.length} 個尚未驗證的模型`, models);
   } catch (error) {
     if (current === generation && query === discoveryGeneration) message.textContent = `查詢未完成：${error}`;
     appendLog('ERROR', `查詢 [${provider}] 模型失敗`, error);
@@ -488,7 +532,7 @@ if (oneClickSetupBtn) {
     oneClickSetupBtn.textContent = '⏳ 正在執行一鍵整合…';
     if (codexStatusMsg) {
       codexStatusMsg.style.display = 'flex';
-      codexStatusMsg.textContent = '🚀 [1/2] 正在同步可用模型清單至 model_catalog.json…';
+      codexStatusMsg.textContent = '🚀 [1/2] 正在同步模型清單至 model_catalog.json…';
       codexStatusMsg.style.color = '#2563eb';
     }
     appendLog('INFO', '開始一鍵設定 ChatGPT Desktop 整合流程…');
@@ -505,7 +549,7 @@ if (oneClickSetupBtn) {
         summary = await window.__TAURI__.core.invoke('sync_model_catalog', {
           customCatalogPath: customCatalogPath || null
         });
-        appendLog('SUCCESS', `[1/2] 模型目錄同步完成 (總計 ${summary.total_models} 款可用模型)`);
+        appendLog('SUCCESS', `[1/2] 模型目錄同步完成 (總計 ${summary.total_models} 筆)`);
       } catch (catErr) {
         appendLog('WARN', `[1/2] 模型清單同步提示: ${catErr}`);
       }
@@ -519,8 +563,8 @@ if (oneClickSetupBtn) {
       });
       appendLog('SUCCESS', `[2/2] 套用閘道設定成功: ${applyMsg}`);
 
-      const totalModels = summary ? summary.total_models : 16;
-      const doneMsg = `✅ 已套用 Custom 供應商端點，並同步 ${totalModels} 款模型目錄。閘道使用自己的 OAuth，沒有讀寫 Codex 登入檔。`;
+      const catalogMessage = summary ? `模型目錄共有 ${summary.total_models} 筆。` : '模型目錄同步未完成，請查看日誌。';
+      const doneMsg = `✅ 已套用 Custom 供應商端點。${catalogMessage}閘道使用自己的 OAuth，沒有讀寫 Codex 登入檔。`;
       if (codexStatusMsg) {
         codexStatusMsg.textContent = doneMsg;
         codexStatusMsg.style.color = '#10b981';
@@ -580,7 +624,7 @@ if (codexSyncCatalogBtn) {
     const customCatalogPath = codexCatalogInput ? codexCatalogInput.value.trim() : "";
     if (codexStatusMsg) {
       codexStatusMsg.style.display = 'flex';
-      codexStatusMsg.textContent = '正在同步可用模型清單至 ChatGPT Desktop (model_catalog.json)…';
+      codexStatusMsg.textContent = '正在同步模型清單至 ChatGPT Desktop (model_catalog.json)…';
       codexStatusMsg.style.color = '#2563eb';
     }
     try {
