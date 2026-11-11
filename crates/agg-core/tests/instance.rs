@@ -1,15 +1,38 @@
 use agg_core::instance;
 use std::{process::Command, time::{SystemTime, UNIX_EPOCH}};
 
+#[cfg(windows)]
+#[test]
+fn adoption_rejects_unrelated_process_and_preserves_guard() {
+    struct Unrelated;
+    impl agg_core::supervisor::AdoptedProcess for Unrelated {
+        fn pid(&self) -> u32 { std::process::id() }
+        fn image(&self) -> Result<std::path::PathBuf, String> { std::env::current_exe().map_err(|e| e.to_string()) }
+        fn alive(&self) -> Result<bool, String> { Ok(true) }
+        fn stop(&self) -> Result<(), String> { panic!("unrelated process must not be stopped") }
+        fn verify(&self, _: u16, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> { panic!("unrelated binary must be rejected first") }
+    }
+    let dir = std::env::temp_dir().join(format!("agg-adopt-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    let runtime = dir.join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let guard = dir.join("gateway.running");
+    instance::create_run_guard(&guard, &runtime).unwrap();
+    assert!(agg_core::supervisor::Supervisor::adopt_desktop(&dir, Box::new(Unrelated), 50833, "testgatewaykey123", "testmanagement123").is_err());
+    assert!(guard.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn local_keys_must_be_saved_and_invalid_files_are_preserved() {
     let dir = std::env::temp_dir().join(format!("agg-keys-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir_all(&dir).unwrap();
     let keys = instance::ensure_local_keys(&dir).unwrap();
     assert_eq!(instance::ensure_local_keys(&dir).unwrap(), keys);
+    assert_eq!(instance::read_local_keys(&dir).unwrap(), keys);
     let path = dir.join("local_keys.json");
     std::fs::write(&path, "invalid").unwrap();
     assert!(instance::ensure_local_keys(&dir).is_err());
+    assert!(instance::read_local_keys(&dir).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid");
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();

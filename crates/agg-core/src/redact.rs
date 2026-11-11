@@ -6,6 +6,9 @@ const KEYS: &[&str] = &[
     "id_token",
     "auth_code",
     "authorization",
+    "experimental_bearer_token",
+    "bearer_token",
+    "x-api-key",
     "api-key",
     "api_key",
     "secret-key",
@@ -170,6 +173,15 @@ mod tests {
         assert!(!clean.contains("abc123"));
         assert!(!clean.contains("xyz789"));
         assert!(!clean.contains("session=keep-out"));
+        assert!(clean.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redacts_experimental_bearer_token_and_x_api_key() {
+        let raw = "experimental_bearer_token = \"supersecretvalue12345\"\nx-api-key: some-long-api-key-val\n";
+        let clean = redact_text(raw);
+        assert!(!clean.contains("supersecretvalue12345"));
+        assert!(!clean.contains("some-long-api-key-val"));
         assert!(clean.contains("<redacted>"));
     }
 }

@@ -205,10 +205,12 @@ pub fn inspect_controlled_tool_roundtrip_with_index(
 pub fn inspect_real_model_tool_roundtrip(
     port: u16, key: &str, request: &Value, model: &str,
     timeout: std::time::Duration, expected_tool_name: &str, expected_index: &str,
+    check_current: impl Fn() -> Result<(), String>,
 ) -> Result<String, String> {
     if expected_tool_name.is_empty() || expected_index.is_empty() {
         return Err("invalid tool probe parameters".into());
     }
+    check_current()?;
     let start = std::time::Instant::now();
     let first = inspect_loopback_stream_with_index(port, key, request, model, timeout, Some(expected_index))?;
     if first.account_trace_matches != Some(true) {
@@ -232,8 +234,10 @@ pub fn inspect_real_model_tool_roundtrip(
     let tool_output = format!("Status: operational. Verification challenge: {challenge}. Reply with exactly: {expected_token}");
     input.push(serde_json::json!({"type":"function_call_output", "call_id":call.call_id, "output":tool_output}));
 
+    check_current()?;
     let remaining = timeout.checked_sub(start.elapsed()).filter(|d| !d.is_zero()).ok_or("已超過回應時限")?;
     let reply = inspect_loopback_stream_with_index(port, key, &second, model, remaining, Some(expected_index))?;
+    check_current()?;
     if reply.account_trace_matches != Some(true) {
         return Err("第二回合缺少或不符合帳號歸屬追蹤標頭 (X-CPA-TRACE-ID)".into());
     }

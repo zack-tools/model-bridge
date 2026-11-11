@@ -1,4 +1,4 @@
-//! OAuth management transport. Authorization URLs and state stay in backend memory.
+﻿//! OAuth management transport. Authorization URLs and state stay in backend memory.
 use crate::{
     http::exchange,
     loopback_callback::LoopbackCallbackServer,
@@ -188,13 +188,20 @@ impl OAuthClient {
         if let Some(mut server) = self.callback_server.take() {
             server.stop();
         }
-        if self.session.state != AuthState::Authorizing { return Err(FailureClass::FlowStopped); }
-        let state = self.session.upstream_state().ok_or(FailureClass::FlowStopped)?;
-        let path = format!("/v8/management/oauth/session?state={state}");
-        let response = self.request("DELETE", &path)?;
-        let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|_| FailureClass::UpstreamRejected)?;
-        if response.status != 200 || value.get("cancelled").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(FailureClass::UpstreamRejected);
+        match self.session.state {
+            AuthState::Authorizing => {
+                let state = self.session.upstream_state().ok_or(FailureClass::FlowStopped)?;
+                let path = format!("/v8/management/oauth/session?state={state}");
+                let response = self.request("DELETE", &path)?;
+                let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|_| FailureClass::UpstreamRejected)?;
+                if response.status != 200 || value.get("cancelled").and_then(|v| v.as_bool()) != Some(true) {
+                    return Err(FailureClass::UpstreamRejected);
+                }
+            }
+            AuthState::Error | AuthState::Expired | AuthState::AwaitingConfirmation => {}
+            AuthState::LoggedOut | AuthState::Authenticated => {
+                return Err(FailureClass::FlowStopped);
+            }
         }
         self.session.cancel();
         Ok(())
@@ -223,5 +230,26 @@ mod state_tests {
         client.session.mark_user_present_authenticated().unwrap();
         assert_eq!(client.poll_user_present().unwrap(), AuthState::Authenticated);
         assert!(client.session.live);
+    }
+
+    #[test]
+    fn cancel_clears_terminal_and_waiting_states_without_network() {
+        for state in [AuthState::Expired, AuthState::Error, AuthState::AwaitingConfirmation] {
+            let mut client = OAuthClient::new(1, "fixture".into(), Provider::ChatGptCodex);
+            client.session.state = state;
+            assert!(client.cancel().is_ok(), "cancel failed for state {state:?}");
+            assert_eq!(client.session.state, AuthState::LoggedOut);
+            assert_eq!(client.session.failure, Some(FailureClass::Cancelled));
+        }
+    }
+
+    #[test]
+    fn cancel_refuses_logged_out_or_authenticated() {
+        let mut client = OAuthClient::new(1, "fixture".into(), Provider::ChatGptCodex);
+        assert_eq!(client.session.state, AuthState::LoggedOut);
+        assert_eq!(client.cancel(), Err(FailureClass::FlowStopped));
+
+        client.session.state = AuthState::Authenticated;
+        assert_eq!(client.cancel(), Err(FailureClass::FlowStopped));
     }
 }

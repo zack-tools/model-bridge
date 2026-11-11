@@ -25,6 +25,8 @@ pub struct StartRequest {
 
 pub struct Supervisor {
     child: Option<Child>,
+    #[cfg(windows)]
+    adopted: Option<Box<dyn AdoptedProcess>>,
     lock: Option<File>,
     pub port: u16,
     pub config_path: PathBuf,
@@ -36,6 +38,15 @@ pub struct Supervisor {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessHealth { Healthy, Degraded, Exited }
+
+#[cfg(windows)]
+pub trait AdoptedProcess: Send {
+    fn pid(&self) -> u32;
+    fn image(&self) -> Result<PathBuf, String>;
+    fn alive(&self) -> Result<bool, String>;
+    fn stop(&self) -> Result<(), String>;
+    fn verify(&self, port: u16, binary: &Path, config: &Path) -> Result<(), String>;
+}
 
 impl std::fmt::Debug for Supervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,6 +119,31 @@ impl SidecarLaunch {
 }
 
 impl Supervisor {
+    #[cfg(windows)]
+    pub fn adopt_desktop(dir: &Path, process: Box<dyn AdoptedProcess>, port: u16, gateway_key: &str, management_key: &str) -> Result<Self, String> {
+        let runtime = dir.join("runtime");
+        crate::instance::desktop_guard_runtime(&dir.join("gateway.running"), &runtime)?;
+        let lock = lock_exclusive(&runtime.join("instance.lock"))?;
+        let binary = process.image()?;
+        if binary.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("cli-proxy-api.exe")) != Some(true) {
+            return Err("背景程序不是預期的閘道核心".into());
+        }
+        let archive = crate::instance::archive_beside(&binary)?;
+        crate::pin::verify_native_binary(&archive, &binary)?;
+        process.verify(port, &binary, &runtime.join("config.yaml"))?;
+        if !process.alive()? { return Err("背景程序已結束".into()); }
+        let redactor = Redactor::new([gateway_key.to_owned(), management_key.to_owned()]);
+        let bearer = format!("Bearer {management_key}");
+        let response = crate::http::exchange(port, "GET", "/v8/management/credentials", &[("Authorization", &bearer)], Duration::from_secs(5), &redactor)?;
+        if response.status != 200 || !process.alive()? { return Err("無法驗證背景閘道的管理身分".into()); }
+        let access = format!("Bearer {gateway_key}");
+        let models = crate::http::exchange(port, "GET", "/v1/models", &[("Authorization", &access)], Duration::from_secs(5), &redactor)?;
+        if models.status != 200 || !process.alive()? { return Err("無法驗證背景閘道的存取金鑰".into()); }
+        Ok(Self { child: None, adopted: Some(process), lock: Some(lock), port,
+            config_path: runtime.join("config.yaml"), auth_dir: runtime.join("auth"),
+            stdout_path: runtime.join("stdout.log"), stderr_path: runtime.join("stderr.log"), redactor })
+    }
+
     pub fn start(req: StartRequest) -> Result<Self, String> {
         Self::start_detailed(req).map_err(|failure| failure.message)
     }
@@ -203,6 +239,8 @@ impl Supervisor {
         })?;
         let mut supervisor = Self {
             child: Some(child),
+            #[cfg(windows)]
+            adopted: None,
             lock: Some(lock),
             port,
             config_path: paths.config_path,
@@ -221,12 +259,17 @@ impl Supervisor {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(|c| c.id())
+        if let Some(child) = self.child.as_ref() { return Some(child.id()); }
+        #[cfg(windows)]
+        if let Some(process) = self.adopted.as_ref() { return Some(process.pid()); }
+        None
     }
 
     /// Leave the child running when the owning application exits.
     pub fn detach(&mut self) {
         self.child.take();
+        #[cfg(windows)]
+        self.adopted.take();
         self.lock.take();
     }
 
@@ -235,6 +278,11 @@ impl Supervisor {
     }
 
     pub fn stop_checked(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(process) = self.adopted.as_ref() {
+            process.stop()?;
+            self.adopted.take();
+        }
         if let Some(child) = self.child.as_mut() {
             if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_none() {
                 if let Err(err) = child.kill() {
@@ -258,10 +306,19 @@ impl Supervisor {
     }
 
     pub fn health(&mut self) -> Result<ProcessHealth, String> {
-        let Some(child) = self.child.as_mut() else { return Ok(ProcessHealth::Exited) };
-        if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_some() {
+        if let Some(child) = self.child.as_mut() {
+            if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_some() { return Ok(ProcessHealth::Exited); }
+        } else {
+            #[cfg(windows)]
+            if self.adopted.as_ref().map(|p| p.alive()).transpose()?.unwrap_or(false) {
+                return self.check_health();
+            }
             return Ok(ProcessHealth::Exited);
         }
+        self.check_health()
+    }
+
+    fn check_health(&self) -> Result<ProcessHealth, String> {
         match crate::http::exchange(self.port, "GET", "/healthz", &[], Duration::from_millis(500), &self.redactor) {
             Ok(resp) if resp.status == 200 && resp.body.contains("ok") => Ok(ProcessHealth::Healthy),
             _ => Ok(ProcessHealth::Degraded),

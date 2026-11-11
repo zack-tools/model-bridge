@@ -6,24 +6,45 @@ use std::time::Duration;
 
 /// Refuse a new login when any credential for this provider already exists.
 pub fn ensure_provider_slot_empty(port: u16, key: &str, source: SourceKind) -> Result<(), String> {
+    if has_provider_credential(port, key, source)? {
+        return Err("此類型已有本機憑證；暫不開放再次授權或新增同類帳號".into());
+    }
+    Ok(())
+}
+
+pub fn has_provider_credential(port: u16, key: &str, source: SourceKind) -> Result<bool, String> {
     let bearer = format!("Bearer {key}");
     let redactor = Redactor::new([key.to_string()]);
     let response = http::exchange(port, "GET", "/v8/management/credentials", &[("Authorization", &bearer)], Duration::from_secs(20), &redactor)
         .map_err(|e| format!("無法檢查既有帳號：{e}"))?;
-    if response.status != 200 { return Err("無法檢查既有帳號；未開始授權".into()); }
-    ensure_slot_empty(&response.body, source)
+    if response.status != 200 { return Err("無法檢查本機憑證狀態".into()); }
+    provider_credential_exists(&response.body, source)
 }
 
-fn ensure_slot_empty(body: &str, source: SourceKind) -> Result<(), String> {
-    let value: Value = serde_json::from_str(body).map_err(|_| "帳號清單格式錯誤；未開始授權")?;
-    let files = value.get("files").and_then(Value::as_array).ok_or("帳號清單不完整；未開始授權")?;
+/// A partial response must never replace a previously complete catalog.
+pub fn discover_all_models(port: u16, key: &str) -> Result<Vec<String>, String> {
+    let mut all = Vec::new();
+    for source in [SourceKind::ChatGptCodex, SourceKind::Antigravity] {
+        if !has_provider_credential(port, key, source)? { continue; }
+        let index = single_active_index(port, key, source)?;
+        let (observed, models) = discover_models(port, key, &index)?;
+        if observed != source { return Err("來源已變更；模型清單未變更".into()); }
+        for model in models { if !all.contains(&model) { all.push(model); } }
+    }
+    if all.is_empty() { return Err("未取得任何模型；原有模型清單保留".into()); }
+    Ok(all)
+}
+
+fn provider_credential_exists(body: &str, source: SourceKind) -> Result<bool, String> {
+    let value: Value = serde_json::from_str(body).map_err(|_| "帳號清單格式錯誤")?;
+    let files = value.get("files").and_then(Value::as_array).ok_or("帳號清單不完整")?;
     let provider = match source { SourceKind::ChatGptCodex => "codex", SourceKind::Antigravity => "antigravity" };
     for entry in files {
         let kind = entry.get("provider").or_else(|| entry.get("type")).and_then(Value::as_str)
-            .ok_or("帳號類型不明；未開始授權")?;
-        if kind == provider { return Err("此類型已有本機憑證；暫不開放再次授權或新增同類帳號".into()); }
+            .ok_or("帳號類型不明")?;
+        if kind == provider { return Ok(true); }
     }
-    Ok(())
+    Ok(false)
 }
 
 pub fn source_for_index(port: u16, management_key: &str, index: &str) -> Result<SourceKind, String> {
@@ -147,12 +168,30 @@ fn parse_source(body: &str, index: &str) -> Result<SourceKind, String> {
 mod tests {
     use super::*;
     #[test]
+    fn partial_provider_failure_does_not_return_a_replacement_catalog() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let credentials = r#"{"files":[{"auth_index":"0123456789abcdef","name":"one.json","provider":"codex","disabled":false,"unavailable":false},{"auth_index":"fedcba9876543210","name":"two.json","provider":"antigravity","disabled":false,"unavailable":false}]}"#;
+            for (status,body) in [(200,credentials),(200,credentials),(200,credentials),(200,r#"{"models":[{"id":"gpt-fixture"}]}"#),(503,"unavailable")] {
+                let (mut socket,_) = listener.accept().unwrap();
+                let mut buffer = [0;4096];
+                socket.read(&mut buffer).unwrap();
+                write!(socket,"HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        assert!(discover_all_models(port,"fixture").is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn new_login_is_blocked_when_provider_has_any_credential() {
-        assert!(ensure_slot_empty(r#"{"files":[]}"#, SourceKind::ChatGptCodex).is_ok());
-        assert!(ensure_slot_empty(r#"{"files":[{"provider":"antigravity"}]}"#, SourceKind::ChatGptCodex).is_ok());
-        assert!(ensure_slot_empty(r#"{"files":[{"provider":"codex","disabled":true}]}"#, SourceKind::ChatGptCodex).is_err());
-        assert!(ensure_slot_empty(r#"{"files":[{}]}"#, SourceKind::ChatGptCodex).is_err());
-        assert!(ensure_slot_empty("{}", SourceKind::ChatGptCodex).is_err());
+        assert!(!provider_credential_exists(r#"{"files":[]}"#, SourceKind::ChatGptCodex).unwrap());
+        assert!(!provider_credential_exists(r#"{"files":[{"provider":"antigravity"}]}"#, SourceKind::ChatGptCodex).unwrap());
+        assert!(provider_credential_exists(r#"{"files":[{"provider":"codex","disabled":true}]}"#, SourceKind::ChatGptCodex).unwrap());
+        assert!(provider_credential_exists(r#"{"files":[{}]}"#, SourceKind::ChatGptCodex).is_err());
+        assert!(provider_credential_exists("{}", SourceKind::ChatGptCodex).is_err());
     }
     #[test]
     fn selecting_account_requires_a_unique_active_provider() {
@@ -173,6 +212,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             for (path, body) in [
                 ("/v8/management/credentials", r#"{"files":[{"auth_index":"0123456789abcdef","name":"private name.json","id":"private name.json","provider":"antigravity","disabled":false,"unavailable":false}]}"#),
+                ("/v8/management/credentials", r#"{"files":[{"auth_index":"0123456789abcdef","name":"private name.json","id":"private name.json","provider":"antigravity","disabled":false,"unavailable":false}]}"#),
                 ("/v8/management/credentials/models?name=private%20name.json", r#"{"models":[{"id":"gemini-example"},{"id":"claude-hidden"},{"id":"other-model"}]}"#),
             ] {
                 let (mut socket, _) = listener.accept().unwrap();
@@ -182,7 +222,8 @@ mod tests {
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
         });
-        let (source, models) = discover_models(port, "fixture-management-key", "0123456789abcdef").unwrap();
+        let index = single_active_index(port, "fixture-management-key", SourceKind::Antigravity).unwrap();
+        let (source, models) = discover_models(port, "fixture-management-key", &index).unwrap();
         assert_eq!(source, SourceKind::Antigravity);
         assert_eq!(models, vec!["gemini-example"]);
         worker.join().unwrap();

@@ -1,8 +1,19 @@
+function formatModelDisplayName(id) {
+  if (id === 'gemini-3.8-flash-high') return 'Gemini 3.8 Flash';
+  if (id === 'gemini-3-flash') return 'Gemini 3 Flash';
+  if (id === 'gemini-3.1-flash-lite') return 'Gemini 3.1 Flash Lite';
+  if (id === 'gemini-3.5-flash-lite') return 'Gemini 3.5 Flash Lite';
+  return id;
+}
+
 const status = document.getElementById('status');
 const start = document.getElementById('start');
 const stop = document.getElementById('stop');
 let generation = 0;
 let discoveryGeneration = 0;
+let verificationGeneration = 0;
+let gatewayReady = false;
+const accountStates = new Map();
 
 const tabs = [...document.querySelectorAll('[role="tab"]')];
 function selectTab(tab, focus = false) {
@@ -84,7 +95,60 @@ if (copyLogBtn) {
   });
 }
 
+function renderAccounts() {
+  let credentials = 0;
+  let known = 0;
+  for (const account of document.querySelectorAll('.account')) {
+    const data = accountStates.get(account.dataset.provider) || {};
+    const hasCred = data.hasCredential !== undefined ? data.hasCredential : data.has_credential;
+    if (typeof hasCred === 'boolean') known++;
+    if (hasCred) credentials++;
+    const flow = ['authorizing', 'awaitingConfirmation', 'awaiting_confirmation', 'expired', 'error'].includes(data.state);
+    for (const button of account.querySelectorAll('button')) {
+      const action = button.dataset.action;
+      let allowed = false;
+      if (action === 'begin') allowed = (data.canStart !== undefined ? data.canStart : (hasCred === false && !flow));
+      else if (action === 'renew') allowed = (data.canRenew !== undefined ? data.canRenew : (hasCred === true && !flow));
+      else if (action === 'poll') allowed = true;
+      else if (action === 'confirm') allowed = (data.canConfirm !== undefined ? data.canConfirm : (data.state === 'awaitingConfirmation' || data.state === 'awaiting_confirmation'));
+      else if (action === 'cancel') allowed = (data.canCancel !== undefined ? data.canCancel : flow);
+      else if (action === 'verify') allowed = (hasCred === true && !flow);
+      button.disabled = !gatewayReady || !!data.busy || !allowed;
+    }
+  }
+  if (metricAccounts) metricAccounts.textContent = known ? (credentials + ' 個本機憑證' + (known < 2 ? '（部分未確認）' : '')) : '未確認';
+  const selected = document.querySelector('.account[data-provider="' + document.getElementById('account-type').value + '"]');
+  if (selected) {
+    const addBtn = document.getElementById('add-account');
+    if (addBtn) addBtn.disabled = selected.querySelector('[data-action="begin"]').disabled;
+  }
+}
+
+async function refreshAccounts(current) {
+  for (const account of document.querySelectorAll('.account')) {
+    const provider = account.dataset.provider;
+    try {
+      const res = await window.__TAURI__.core.invoke('oauth_action', { provider, action: 'poll' });
+      if (current === generation) {
+        if (res && typeof res === 'object') {
+          accountStates.set(provider, res);
+          account.querySelector('p').textContent = res.message || '';
+        } else {
+          account.querySelector('p').textContent = String(res);
+        }
+      }
+    } catch (_) {
+      if (current === generation) {
+        account.querySelector('p').textContent = '無法檢查憑證狀態；請稍後重試';
+      }
+    }
+  }
+  renderAccounts();
+}
+
 function resetAccounts() {
+  gatewayReady = false;
+  accountStates.clear();
   ++discoveryGeneration;
   if (metricAccounts) metricAccounts.textContent = '未確認';
   if (metricModels) metricModels.textContent = '尚未查詢';
@@ -105,6 +169,7 @@ function resetAccounts() {
   for (const account of document.querySelectorAll('.account')) {
     account.querySelector('p').textContent = '閘道已停止；本機憑證保留，登入狀態未確認';
   }
+  renderAccounts();
   appendLog('INFO', '帳號與模型清單狀態已重置');
 }
 
@@ -153,16 +218,34 @@ async function monitor(current, startError = null) {
       resetAccounts();
       return;
     }
+    if (result.state === 'degraded') {
+      gatewayReady = true;
+      status.textContent = '閘道無法回應健康檢查：127.0.0.1:' + result.port;
+      if (pulseIndicator) pulseIndicator.className = 'pulse-dot degraded';
+      if (quickStatusText) quickStatusText.textContent = '🟡 回應降級 (埠號 ' + result.port + ')';
+      if (metricPort) metricPort.textContent = '127.0.0.1:' + result.port;
+      if (metricStatusHint) metricStatusHint.textContent = '閘道健康檢查異常或逾時';
+      stop.disabled = false;
+      start.disabled = true;
+      renderAccounts();
+      return;
+    }
     status.textContent = result.state === 'healthy'
-      ? `閘道健康運作中：127.0.0.1:${result.port}`
+      ? (result.adopted ? '已安全接管背景閘道：127.0.0.1:' + result.port : '閘道健康運作中：127.0.0.1:' + result.port)
       : `閘道無法回應健康檢查：127.0.0.1:${result.port}`;
     if (result.state === 'healthy') {
+      gatewayReady = true;
+      if (result.adopted) {
+        appendLog('SUCCESS', '已安全接管背景閘道');
+        void refreshAccounts(current);
+      }
       if (pulseIndicator) pulseIndicator.className = 'pulse-dot running';
       if (quickStatusText) quickStatusText.textContent = `🟢 運作中 (埠號 ${result.port})`;
       if (metricPort) metricPort.textContent = `127.0.0.1:${result.port}`;
-      if (metricStatusHint) metricStatusHint.textContent = '健康狀態良好 • 背景常駐中';
+      if (metricStatusHint) metricStatusHint.textContent = '閘道健康檢查通過';
       stop.disabled = false;
       start.disabled = true;
+      renderAccounts();
     }
   } catch (_) {
     if (current !== generation) return;
@@ -192,15 +275,7 @@ start.addEventListener('click', async () => {
       const info = document.getElementById('inspection');
       if (info) info.textContent = `閘道已啟動，但無法恢復供應商設定：${error}`;
     }
-    for (const account of document.querySelectorAll('.account')) {
-      const provider = account.dataset.provider;
-      try {
-        const msg = await window.__TAURI__.core.invoke('oauth_action', { provider, action: 'poll' });
-        account.querySelector('p').textContent = msg;
-      } catch (_) {
-        account.querySelector('p').textContent = '登入狀態未確認；已有本機憑證時暫不支援重新授權';
-      }
-    }
+    await refreshAccounts(current);
     stop.disabled = false;
     monitor(current);
     await checkCodexConfigStatus();
@@ -290,20 +365,36 @@ for (const account of document.querySelectorAll('.account')) {
       const current = generation;
       const provider = account.dataset.provider;
       const action = button.dataset.action;
-      for (const item of account.querySelectorAll('button')) item.disabled = true;
+      const st = accountStates.get(provider) || {};
+      st.busy = true;
+      renderAccounts();
       result.textContent = '處理中…';
       appendLog('INFO', `帳號 [${provider}] 操作 [${action}] 開始`);
       try {
-        const message = action === 'begin'
-          ? await window.__TAURI__.core.invoke('oauth_start', { provider, terms: document.getElementById('terms').checked })
-          : await window.__TAURI__.core.invoke('oauth_action', { provider, action });
-        if (current === generation) result.textContent = message;
-        appendLog('SUCCESS', `帳號 [${provider}] 操作 [${action}] 結果`, message);
+        let res;
+        if (action === 'begin') {
+          res = await window.__TAURI__.core.invoke('oauth_start', { provider, terms: document.getElementById('terms').checked, renew: false });
+        } else if (action === 'renew') {
+          res = await window.__TAURI__.core.invoke('oauth_start', { provider, terms: document.getElementById('terms').checked, renew: true });
+        } else {
+          res = await window.__TAURI__.core.invoke('oauth_action', { provider, action });
+        }
+        if (current === generation) {
+          if (res && typeof res === 'object') {
+            accountStates.set(provider, res);
+            result.textContent = res.message || '';
+          } else {
+            result.textContent = String(res);
+          }
+          appendLog('SUCCESS', '帳號 [' + provider + '] 操作 [' + action + '] 結果', res);
+        }
       } catch (error) {
         if (current === generation) result.textContent = `操作未完成：${error}`;
         appendLog('ERROR', `帳號 [${provider}] 操作 [${action}] 失敗`, error);
       } finally {
-        for (const item of account.querySelectorAll('button')) item.disabled = false;
+        const finalSt = accountStates.get(provider) || {};
+        finalSt.busy = false;
+        renderAccounts();
       }
     });
   }
@@ -375,7 +466,8 @@ document.getElementById('discover-models').addEventListener('click', async () =>
       for (const model of models) {
         const opt = document.createElement('option');
         opt.value = model;
-        opt.textContent = model;
+        const optDisp = formatModelDisplayName(model);
+        opt.textContent = optDisp !== model ? `${optDisp} (${model})` : model;
         select.appendChild(opt);
       }
       if (verifyBtn) verifyBtn.disabled = false;
@@ -385,7 +477,8 @@ document.getElementById('discover-models').addEventListener('click', async () =>
       item.id = `model-entry-${model.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
       const isGemini = model.startsWith('gemini');
       const badgeIcon = isGemini ? '✨' : '⚡️';
-      item.textContent = `${badgeIcon} ${model}（已發現，尚未驗證）`;
+      const disp = formatModelDisplayName(model);
+      item.textContent = `${badgeIcon} ${disp} [${model}]（已發現，尚未驗證）`;
       list.appendChild(item);
     }
     message.textContent = models.length ? `已發現 ${models.length} 個模型，尚未驗證` : '目前沒有可顯示的模型';
@@ -404,6 +497,8 @@ document.getElementById('discover-models').addEventListener('click', async () =>
 const verifyBtn = document.getElementById('verify-model');
 if (verifyBtn) {
   verifyBtn.addEventListener('click', async () => {
+    const current = generation;
+    const currentDiscovery = discoveryGeneration;
     const consent = document.getElementById('quota-consent').checked;
     const verifyStatus = document.getElementById('verify-status');
     const select = document.getElementById('verify-model-select');
@@ -427,23 +522,31 @@ if (verifyBtn) {
         model,
         quotaConfirmed: consent
       });
+      if (current !== generation || currentDiscovery !== discoveryGeneration) return;
       verifyStatus.textContent = `驗證成功：${result}`;
       appendLog('SUCCESS', `Gate 3 驗證通過：模型 [${model}]`, result);
+      const account = document.querySelector('.account[data-provider="' + provider + '"]');
+      if (account) account.querySelector('p').textContent = '本次模型測試通過，追蹤標頭符合該憑證；不保證帳號身分或後續持續有效';
       const entry = document.getElementById(`model-entry-${model.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
       if (entry) {
-        entry.textContent = `✓ ${model}（verified live）`;
+        entry.textContent = `✓ ${model}（本次驗證通過）`;
         entry.style.fontWeight = 'bold';
-        entry.style.color = '#10b981';
+        entry.style.color = 'var(--success, #15765d)';
       }
       const codexModelInput = document.getElementById('codex-model-input');
       if (codexModelInput && !codexModelInput.value) {
         codexModelInput.value = model;
       }
     } catch (error) {
+      if (current !== generation || currentDiscovery !== discoveryGeneration) return;
       verifyStatus.textContent = `驗證失敗：${error}`;
+      const account = document.querySelector('.account[data-provider="' + provider + '"]');
+      if (account) account.querySelector('p').textContent = '本次模型驗證未通過；請查看模型管理的錯誤訊息';
       appendLog('ERROR', `Gate 3 驗證失敗：模型 [${model}]`, error);
     } finally {
-      verifyBtn.disabled = false;
+      if (current === generation && currentDiscovery === discoveryGeneration) {
+        verifyBtn.disabled = false;
+      }
     }
   });
 }
@@ -559,7 +662,8 @@ if (oneClickSetupBtn) {
       const applyMsg = await window.__TAURI__.core.invoke('codex_apply', {
         customPath: customPath || null,
         model: model || null,
-        allowOverride: allowOverride
+        allowOverride: allowOverride,
+        customCatalogPath: customCatalogPath || null
       });
       appendLog('SUCCESS', `[2/2] 套用閘道設定成功: ${applyMsg}`);
 
@@ -658,10 +762,12 @@ if (codexPreviewDiffBtn) {
       codexStatusMsg.style.color = '#2563eb';
     }
     try {
+      const customCatalogPath = codexCatalogInput ? codexCatalogInput.value.trim() : "";
       const preview = await window.__TAURI__.core.invoke('codex_preview', {
         customPath: customPath || null,
         model: model || null,
-        allowOverride: allowOverride
+        allowOverride: allowOverride,
+        customCatalogPath: customCatalogPath || null
       });
       if (codexPreviewBox && codexDiffOutput) {
         codexPreviewBox.style.display = 'block';
@@ -693,10 +799,12 @@ if (codexApplyBtn) {
       codexStatusMsg.style.color = '#2563eb';
     }
     try {
+      const customCatalogPath = codexCatalogInput ? codexCatalogInput.value.trim() : "";
       const msg = await window.__TAURI__.core.invoke('codex_apply', {
         customPath: customPath || null,
         model: model || null,
-        allowOverride: allowOverride
+        allowOverride: allowOverride,
+        customCatalogPath: customCatalogPath || null
       });
       if (codexStatusMsg) {
         codexStatusMsg.textContent = msg;
@@ -770,6 +878,7 @@ if (autostartCheckbox) {
   });
 
   autostartCheckbox.addEventListener('change', async () => {
+    const previous = !autostartCheckbox.checked;
     try {
       const enabled = await window.__TAURI__.core.invoke('set_autostart_gateway', { enabled: autostartCheckbox.checked });
       autostartCheckbox.checked = !!enabled;
@@ -778,6 +887,7 @@ if (autostartCheckbox) {
       }
       appendLog('SUCCESS', `開機自動開閘設定已更新：${enabled ? '已啟用（開機自動在背景啟動閘道，不開 UI）' : '已關閉開機自動開閘'}`);
     } catch (err) {
+      autostartCheckbox.checked = previous;
       appendLog('ERROR', '開機自動開閘設定失敗', err);
       if (autostartStatus) {
         autostartStatus.textContent = `⚠️ 設定失敗：${err}`;
@@ -785,3 +895,109 @@ if (autostartCheckbox) {
     }
   });
 }
+
+// === VS Code (Copilot & Agent) 整合模組 ===
+const vscodeDeployBtn = document.getElementById('vscode-deploy-btn');
+const vscodeDeployActionBtn = document.getElementById('vscode-deploy-action-btn');
+const vscodeCheckStatusBtn = document.getElementById('vscode-check-status-btn');
+const vscodePreviewBtn = document.getElementById('vscode-preview-btn');
+const vscodePathInput = document.getElementById('vscode-path-input');
+const vscodeDetectInfo = document.getElementById('vscode-detect-info');
+const vscodeStatusMsg = document.getElementById('vscode-status-msg');
+const vscodePreviewBox = document.getElementById('vscode-preview-box');
+const vscodeDiffOutput = document.getElementById('vscode-diff-output');
+
+async function checkVSCodeStatus() {
+  const path = vscodePathInput ? vscodePathInput.value.trim() : '';
+  try {
+    const res = await window.__TAURI__.core.invoke('vscode_status', { customPath: path || null });
+    if (vscodePathInput && !vscodePathInput.value) {
+      vscodePathInput.value = res.target_path;
+    }
+    let desc = '檔案存在: ' + (res.exists ? '是' : '否');
+    if (res.exists) {
+      desc += ' | 配置模型: ' + res.model_count + ' 款';
+      desc += ' | ModelBridge 管理: ' + (res.configured_by_bridge ? '是' : '否');
+      if (res.has_backup) desc += ' (有備份檔可還原)';
+    }
+    if (vscodeDetectInfo) vscodeDetectInfo.textContent = desc;
+    return res;
+  } catch (err) {
+    if (vscodeDetectInfo) vscodeDetectInfo.textContent = 'VS Code 狀態檢查失敗: ' + err;
+  }
+}
+
+async function deployToVSCode() {
+  const path = vscodePathInput ? vscodePathInput.value.trim() : '';
+  if (vscodeStatusMsg) {
+    vscodeStatusMsg.style.display = 'flex';
+    vscodeStatusMsg.textContent = '🚀 正在部署模型配置至 VS Code…';
+    vscodeStatusMsg.style.color = '#2563eb';
+  }
+  appendLog('INFO', '開始部署聚合模型至 VS Code chatLanguageModels.json…');
+  try {
+    const res = await window.__TAURI__.core.invoke('vscode_deploy', { customPath: path || null });
+    if (vscodeStatusMsg) {
+      vscodeStatusMsg.style.display = 'flex';
+      vscodeStatusMsg.textContent = '✅ ' + res.message + ' [路徑: ' + res.target_path + ']';
+      vscodeStatusMsg.style.color = '#10b981';
+    }
+    appendLog('SUCCESS', 'VS Code 部署成功: ' + res.message, res);
+    await checkVSCodeStatus();
+  } catch (err) {
+    if (vscodeStatusMsg) {
+      vscodeStatusMsg.style.display = 'flex';
+      vscodeStatusMsg.textContent = '❌ 部署失敗: ' + err;
+      vscodeStatusMsg.style.color = '#ef4444';
+    }
+    appendLog('ERROR', 'VS Code 部署失敗: ' + err);
+  }
+}
+
+if (vscodeDeployBtn) {
+  vscodeDeployBtn.addEventListener('click', async () => {
+    vscodeDeployBtn.disabled = true;
+    const old = vscodeDeployBtn.textContent;
+    vscodeDeployBtn.textContent = '⏳ 正在部署…';
+    try {
+      await deployToVSCode();
+    } finally {
+      vscodeDeployBtn.disabled = false;
+      vscodeDeployBtn.textContent = old;
+    }
+  });
+}
+
+if (vscodeDeployActionBtn) {
+  vscodeDeployActionBtn.addEventListener('click', deployToVSCode);
+}
+
+if (vscodeCheckStatusBtn) {
+  vscodeCheckStatusBtn.addEventListener('click', checkVSCodeStatus);
+}
+
+if (vscodePreviewBtn) {
+  vscodePreviewBtn.addEventListener('click', async () => {
+    try {
+      const preview = await window.__TAURI__.core.invoke('vscode_preview', { customPath: vscodePathInput ? vscodePathInput.value.trim() || null : null });
+      if (vscodePreviewBox && vscodeDiffOutput) {
+        vscodePreviewBox.style.display = 'block';
+        vscodeDiffOutput.textContent = preview;
+      }
+      if (vscodeStatusMsg) {
+        vscodeStatusMsg.style.display = 'flex';
+        vscodeStatusMsg.textContent = '預覽完成：已產生 VS Code 配置 JSON（金鑰已遮蔽保護）';
+        vscodeStatusMsg.style.color = '#10b981';
+      }
+    } catch (err) {
+      if (vscodeStatusMsg) {
+        vscodeStatusMsg.style.display = 'flex';
+        vscodeStatusMsg.textContent = '預覽失敗: ' + err;
+        vscodeStatusMsg.style.color = '#ef4444';
+      }
+    }
+  });
+}
+
+// 初始化偵測 VS Code
+checkVSCodeStatus();

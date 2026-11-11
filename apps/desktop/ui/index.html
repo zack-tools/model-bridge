@@ -18,8 +18,8 @@
         --text-muted: #64748b;
         --primary: #2563eb;
         --primary-hover: #1d4ed8;
-        --success: #10b981;
-        --success-hover: #059669;
+        --success: #15765d;
+        --success-hover: #105c49;
         --warning: #f59e0b;
         --danger: #ef4444;
         --danger-hover: #dc2626;
@@ -120,9 +120,23 @@
         background: #94a3b8;
       }
       .pulse-dot.running {
-        background: #10b981;
-        box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+        background: var(--success);
+        box-shadow: 0 0 0 2px rgba(21, 118, 93, 0.2);
         animation: pulse 2s infinite;
+      }
+      .pulse-dot.degraded {
+        background: var(--danger);
+        box-shadow: 0 0 0 2px rgba(180, 35, 56, 0.2);
+        animation: pulse 1s infinite;
+      }
+      .pulse-dot.warning {
+        background: var(--warning);
+        box-shadow: 0 0 0 2px rgba(163, 75, 8, 0.2);
+      }
+      .pulse-dot.transitioning {
+        background: var(--primary);
+        box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+        animation: pulse 1.5s infinite;
       }
       @keyframes pulse {
         0%, 100% { opacity: 1; transform: scale(1); }
@@ -534,7 +548,7 @@
         <div class="metric-card">
           <div class="metric-label">帳號狀態</div>
           <div class="metric-value" id="metric-accounts">未確認</div>
-          <div class="metric-hint">請查看下方帳號授權狀態</div>
+          <div class="metric-hint">請至「帳號管理」檢查各類帳號</div>
         </div>
         <div class="metric-card">
           <div class="metric-label">目前查詢的模型</div>
@@ -584,7 +598,7 @@
         <div class="quick-setup-box">
           <div class="quick-setup-text">
             <h3>快速設定用戶端</h3>
-            <p>同步模型清單目錄 (model_catalog) 並套用 Custom 閘道端點。不會讀寫 Codex 的登入檔。</p>
+            <p>嘗試同步模型目錄並套用 Custom 閘道端點；同步失敗時仍會嘗試套用端點。此操作不讀寫 Codex 登入檔。</p>
           </div>
           <button id="one-click-setup-btn" type="button" class="btn-highlight">一鍵套用閘道</button>
         </div>
@@ -601,14 +615,14 @@
         </div>
 
         <div class="form-group">
-          <label for="codex-model-input">指定預設模型（選填，例：gpt-6.1-terra 或 gemini-3.8-flash-high）：</label>
+          <label for="codex-model-input">指定預設模型（選填，請填入查詢到的模型名稱）：</label>
           <input id="codex-model-input" type="text" placeholder="留空將維持目前設定">
         </div>
 
         <div class="form-group">
           <label class="checkbox-label">
             <input id="codex-allow-override" type="checkbox" checked>
-            允許切換既有之 model_provider 為 <strong>Custom</strong>（系統自動建立安全備份 .bak）
+            允許切換既有的 model_provider 為 <strong>Custom</strong>（變更前會備份既有設定）
           </label>
         </div>
 
@@ -617,7 +631,7 @@
           <button id="codex-sync-auth-btn" type="button" class="btn-success">🔍 預覽登入隔離</button>
           <button id="codex-sync-catalog-btn" type="button" style="background:#0284c7; color:#fff;">📋 同步模型目錄 (model_catalog)</button>
           <button id="codex-apply-btn" type="button" class="btn-primary">💾 套用至 config.toml</button>
-          <button id="codex-preview-diff" type="button">🔍 預覽安全 Diff</button>
+          <button id="codex-preview-diff" type="button">🔍 預覽設定變更</button>
           <button id="codex-check-status" type="button">ℹ️ 檢查檔案狀態</button>
           <button id="codex-rollback-btn" type="button">↩️ 還原先前設定</button>
         </div>
@@ -625,8 +639,44 @@
         <p id="codex-status-msg" class="status-banner" role="status" aria-live="polite" style="display:none;"></p>
 
         <div id="codex-preview-box" style="display: none; margin-top: 0.75rem;">
-          <div style="font-size: 0.8rem; font-weight: 600; margin-bottom: 0.3rem;">安全變更預覽（機密金鑰已紅化保護）：</div>
+          <div style="font-size: 0.8rem; font-weight: 600; margin-bottom: 0.3rem;">設定變更預覽（金鑰已遮蔽）：</div>
           <pre id="codex-diff-output" style="background: #0f172a; color: #a5b4fc; padding: 0.85rem; border-radius: var(--radius-sm); font-size: 0.78rem; max-height: 180px; overflow-y: auto; white-space: pre-wrap; font-family: var(--font-mono);"></pre>
+        </div>
+      </section>
+
+      <!-- 核心區塊 2.5: VS Code (Copilot & Agent) 整合設定 -->
+      <section id="vscode-config-section" class="card-section" style="margin-top: 1.25rem;">
+        <div class="card-section-header">
+          <h2>VS Code (Copilot & Agent) 整合</h2>
+        </div>
+
+        <!-- 一鍵部署至 VS Code 按鈕區塊 -->
+        <div class="quick-setup-box">
+          <div class="quick-setup-text">
+            <h3>快速部署至 VS Code</h3>
+            <p>將 ModelBridge 聚合端點與模型（Gemini 3.8 Flash、GPT-6.1 Terra、Claude Opus 4.6 等）自動注入 VS Code 之 chatLanguageModels.json，原生支援思考深度（低/中/高）與 Bearer 授權標頭。</p>
+          </div>
+          <button id="vscode-deploy-btn" type="button" class="btn-highlight">一鍵部署至 VS Code</button>
+        </div>
+
+        <div class="form-group">
+          <label for="vscode-path-input">VS Code 模型設定檔路徑 (chatLanguageModels.json)：</label>
+          <input id="vscode-path-input" type="text" placeholder="自動偵測中...">
+          <p id="vscode-detect-info" class="field-note"></p>
+        </div>
+
+        <!-- 獨立進階操作按鈕列 -->
+        <div style="display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.85rem;">
+          <button id="vscode-deploy-action-btn" type="button" class="btn-primary">💾 部署設定至 VS Code</button>
+          <button id="vscode-preview-btn" type="button">🔍 預覽 VS Code 配置 (JSON)</button>
+          <button id="vscode-check-status-btn" type="button">ℹ️ 檢查 VS Code 設定狀態</button>
+        </div>
+
+        <p id="vscode-status-msg" class="status-banner" role="status" aria-live="polite" style="display:none;"></p>
+
+        <div id="vscode-preview-box" style="display: none; margin-top: 0.75rem;">
+          <div style="font-size: 0.8rem; font-weight: 600; margin-bottom: 0.3rem;">VS Code 設定預覽（金鑰已遮蔽）：</div>
+          <pre id="vscode-diff-output" style="background: #0f172a; color: #a5b4fc; padding: 0.85rem; border-radius: var(--radius-sm); font-size: 0.78rem; max-height: 220px; overflow-y: auto; white-space: pre-wrap; font-family: var(--font-mono);"></pre>
         </div>
       </section>
 
@@ -638,7 +688,7 @@
           <h2>帳號授權</h2>
         </div>
         <p class="section-desc">
-          每種類型目前僅提供一個授權位置。若本機已有該類憑證，目前會暫停再次授權，以避免新增同類帳號；重新啟動後的安全重新確認功能尚未支援。
+          每種類型目前僅提供一個授權位置。已有憑證時，可至「模型管理」查詢模型並在同意消耗額度後執行驗證；重新啟動後須重新驗證。
         </p>
 
         <div class="account-add">
@@ -669,9 +719,10 @@
             </div>
             <div class="account-actions">
               <button data-action="begin" class="btn-primary" hidden>瀏覽器登入</button>
+              <button data-action="renew" class="btn-primary" hidden>重新授權</button>
               <button data-action="poll">檢查狀態</button>
-              <button data-action="confirm" class="btn-success">確認完成</button>
-              <button data-action="cancel" class="btn-danger">取消</button>
+              <button data-action="confirm" class="btn-success">確認本次登入</button>
+              <button data-action="cancel" class="btn-danger">取消授權流程</button>
             </div>
           </div>
 
@@ -686,9 +737,10 @@
             </div>
             <div class="account-actions">
               <button data-action="begin" class="btn-primary" hidden>瀏覽器登入</button>
+              <button data-action="renew" class="btn-primary" hidden>重新授權</button>
               <button data-action="poll">檢查狀態</button>
-              <button data-action="confirm" class="btn-success">確認完成</button>
-              <button data-action="cancel" class="btn-danger">取消</button>
+              <button data-action="confirm" class="btn-success">確認本次登入</button>
+              <button data-action="cancel" class="btn-danger">取消授權流程</button>
             </div>
           </div>
         </div>
@@ -701,7 +753,7 @@
         <div class="card-section-header">
           <h2>模型清單與驗證</h2>
         </div>
-        <p class="section-desc">向本機閘道查詢已認證帳號所帶出之模型，並可對特定模型執行真實串流雙回合工具調用驗證。</p>
+        <p class="section-desc">向本機閘道查詢憑證的模型清單；清單不代表模型已驗證。可選擇模型，並在同意消耗額度後執行真實驗證。</p>
 
         <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
           <label for="model-provider" style="font-size:0.82rem; font-weight:600;">查詢帳號：</label>
@@ -709,7 +761,7 @@
             <option value="codex">ChatGPT / Codex (GPT 系列)</option>
             <option value="antigravity">Antigravity (Gemini 系列)</option>
           </select>
-          <button id="discover-models" type="button" class="btn-primary">查詢可用模型</button>
+          <button id="discover-models" type="button" class="btn-primary">查詢模型清單</button>
         </div>
 
         <p id="model-status" class="field-note" role="status" aria-live="polite" style="margin-top:0.4rem;"></p>
@@ -718,10 +770,10 @@
         <!-- Gate 3 探針區 -->
         <div id="gate3-box" style="margin-top: 1rem; padding: 1rem; background: var(--bg-subtle); border: 1px dashed var(--border-color); border-radius: var(--radius-md);">
           <div style="font-size:0.9rem; font-weight:700; margin-bottom:0.35rem; color:var(--text-primary);">
-            🎯 Gate 3 真實雙向串流與工具回合驗收探針
+            🎯 模型串流與工具呼叫驗證
           </div>
           <p style="font-size:0.78rem; color:var(--text-secondary); margin:0 0 0.6rem;">
-            向所選模型發送串流請求，驗證工具呼叫及帳號來源。<strong>此操作將發送真實請求並消耗額度</strong>。
+            向所選模型發送串流請求，驗證工具呼叫及帳號來源。若閘道未提供帳號追蹤資訊，無法確認帳號來源。<strong>此操作將發送真實請求並可能消耗額度，即使驗證失敗亦然</strong>。
           </p>
           <div style="margin-bottom:0.6rem;">
             <label class="checkbox-label">
@@ -730,10 +782,10 @@
             </label>
           </div>
           <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
-            <select id="verify-model-select" style="max-width:18rem;">
+            <select id="verify-model-select" aria-label="選擇測試模型" style="max-width:18rem;">
               <option value="">-- 請先查詢模型 --</option>
             </select>
-            <button id="verify-model" type="button" class="btn-primary" disabled>發起工具回合驗收</button>
+            <button id="verify-model" type="button" class="btn-primary" disabled>開始模型驗證</button>
           </div>
           <p id="verify-status" class="field-note" role="status" aria-live="polite" style="margin-top:0.4rem;"></p>
         </div>

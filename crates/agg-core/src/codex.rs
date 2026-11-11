@@ -913,7 +913,23 @@ pub fn preview_apply(req: &ApplyRequest) -> Result<ApplyPreview, CodexError> {
     let before = read_existing(&req.config_path)?;
     reject_foreign(&req.config_path, &before, req.allow_foreign_override)?;
     let after = mutate(&before, req)?;
-    let diff = Redactor::new([req.gateway_key.clone()]).redact(&line_diff(&before, &after));
+    let mut secrets = vec![req.gateway_key.clone()];
+    if let Ok(doc) = before.parse::<DocumentMut>() {
+        if let Some(providers) = doc.get("model_providers").and_then(Item::as_table_like) {
+            for (_, provider) in providers.iter() {
+                if let Some(p_table) = provider.as_table_like() {
+                    for key in ["experimental_bearer_token", "bearer_token", "api_key", "wire_api_key"] {
+                        if let Some(token) = p_table.get(key).and_then(Item::as_str) {
+                            if token.len() >= 8 {
+                                secrets.push(token.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let diff = Redactor::new(secrets).redact(&line_diff(&before, &after));
     Ok(ApplyPreview {
         diff,
         creates_file: !req.config_path.exists(),
@@ -964,7 +980,14 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
         sha256_managed: Some(crate::pin::sha256_bytes(managed_canonical(&after)?.as_bytes())),
     };
     let body = serde_json::to_vec_pretty(&ownership).map_err(|e| CodexError::Message(e.to_string()))?;
-    atomic_write(&ownership_path, &body)?;
+    if let Err(e) = atomic_write(&ownership_path, &body) {
+        if existed {
+            let _ = atomic_write(&req.config_path, before.as_bytes());
+        } else {
+            let _ = fs::remove_file(&req.config_path);
+        }
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -997,7 +1020,20 @@ pub fn rollback_config(config_path: &Path) -> Result<(), CodexError> {
     if has_foreign_table(&stripped) {
         // Keep the live document's foreign tables, including ones Codex wrote
         // as an implicit [projects."<dir>"] parent. Do not delete the file.
-        atomic_write(config_path, stripped.to_string().as_bytes())?;
+        let final_text = if let Some(backup_name) = &origin.backup {
+            if let Ok(bytes) = fs::read(parent.join(backup_name)) {
+                if let Ok(backup_str) = std::str::from_utf8(&bytes) {
+                    restore_backup_with_foreign_tables(backup_str, &stripped)?
+                } else {
+                    stripped.to_string()
+                }
+            } else {
+                stripped.to_string()
+            }
+        } else {
+            stripped.to_string()
+        };
+        atomic_write(config_path, final_text.as_bytes())?;
     } else if let Some(backup_name) = &origin.backup {
         local_backup_name(backup_name)?;
         let bytes = fs::read(parent.join(backup_name)).map_err(|e| CodexError::Message(e.to_string()))?;
@@ -1038,6 +1074,27 @@ fn validate_request(req: &ApplyRequest) -> Result<(), CodexError> {
         return Err(CodexError::Message("refusing to write a claude model id".into()));
     }
     Ok(())
+}
+
+fn restore_backup_with_foreign_tables(backup_text: &str, stripped: &DocumentMut) -> Result<String, CodexError> {
+    let mut doc = backup_text.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+    for (key, item) in stripped.iter() {
+        if key == "model_provider" || key == "model" || key == "model_catalog_json" || key == "model_reasoning_effort" || key == "model_providers" {
+            continue;
+        }
+        if let Some(target_table) = doc.get_mut(key).and_then(Item::as_table_like_mut) {
+            if let Some(src_table) = item.as_table_like() {
+                for (sub_key, sub_item) in src_table.iter() {
+                    if !target_table.contains_key(sub_key) {
+                        target_table.insert(sub_key, sub_item.clone());
+                    }
+                }
+            }
+        } else if !doc.contains_key(key) {
+            doc.insert(key, item.clone());
+        }
+    }
+    Ok(doc.to_string())
 }
 
 fn validate_base_url(url: &str) -> Result<(), CodexError> {

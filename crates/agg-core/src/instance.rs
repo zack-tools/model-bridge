@@ -172,17 +172,25 @@ pub fn default_app_data_dir() -> Result<PathBuf, String> {
 }
 
 /// 確保本機存取金鑰與管理金鑰存在（0600 權限保存）
+pub fn read_local_keys(dir: &Path) -> Result<(String, String), String> {
+    let content = std::fs::read_to_string(dir.join("local_keys.json"))
+        .map_err(|_| "無法讀取既有本機金鑰".to_string())?;
+    parse_local_keys(&content)
+}
+
+fn parse_local_keys(content: &str) -> Result<(String, String), String> {
+    let val: serde_json::Value = serde_json::from_str(content)
+        .map_err(|_| "本機金鑰檔格式錯誤；保留原檔".to_string())?;
+    let valid = |key: &str| key.len() >= 16 && key.bytes().all(|b| b.is_ascii_alphanumeric());
+    let gw = val["gateway_key"].as_str().filter(|s| valid(s)).ok_or("閘道金鑰無效；保留原檔")?;
+    let mgmt = val["management_key"].as_str().filter(|s| valid(s)).ok_or("管理金鑰無效；保留原檔")?;
+    Ok((gw.to_string(), mgmt.to_string()))
+}
+
 pub fn ensure_local_keys(dir: &Path) -> Result<(String, String), String> {
     let key_file = dir.join("local_keys.json");
     match std::fs::read_to_string(&key_file) {
-        Ok(content) => {
-            let val: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|_| "本機金鑰檔格式錯誤；保留原檔".to_string())?;
-            let valid = |key: &str| key.len() >= 16 && key.bytes().all(|b| b.is_ascii_alphanumeric());
-            let gw = val["gateway_key"].as_str().filter(|s| valid(s)).ok_or("閘道金鑰無效；保留原檔")?;
-            let mgmt = val["management_key"].as_str().filter(|s| valid(s)).ok_or("管理金鑰無效；保留原檔")?;
-            return Ok((gw.to_string(), mgmt.to_string()));
-        }
+        Ok(content) => return parse_local_keys(&content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(format!("無法讀取本機金鑰；保留原檔：{err}")),
     }

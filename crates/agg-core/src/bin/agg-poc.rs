@@ -156,21 +156,10 @@ fn main() {
                 exit(1);
             });
             let port = 50833u16;
-            let mut all_models = Vec::new();
-            if let Ok(index) = agg_core::attribution::single_active_index(port, &management_key, agg_core::registry::SourceKind::ChatGptCodex) {
-                if let Ok((_, models)) = agg_core::attribution::discover_models(port, &management_key, &index) {
-                    for m in models {
-                        if !all_models.contains(&m) { all_models.push(m); }
-                    }
-                }
-            }
-            if let Ok(index) = agg_core::attribution::single_active_index(port, &management_key, agg_core::registry::SourceKind::Antigravity) {
-                if let Ok((_, models)) = agg_core::attribution::discover_models(port, &management_key, &index) {
-                    for m in models {
-                        if !all_models.contains(&m) { all_models.push(m); }
-                    }
-                }
-            }
+            let all_models = agg_core::attribution::discover_all_models(port, &management_key).unwrap_or_else(|e| {
+                eprintln!("同步失敗，原有模型清單保留：{e}");
+                exit(1);
+            });
             let env_codex = std::env::var("CODEX_HOME").ok();
             let env_home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
             let os = std::env::consts::OS;

@@ -21,6 +21,7 @@ pub mod redact;
 pub mod registry;
 pub mod response_evidence;
 pub mod supervisor;
+pub mod vscode;
 
 pub use check::CoreCheckReport;
 pub use platform::assess_platform;
