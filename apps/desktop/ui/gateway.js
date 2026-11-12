@@ -69,7 +69,9 @@ async function appendLog(level, message, details = "") {
   }
   try {
     await window.__TAURI__.core.invoke('log_message', { level, message, details: detailsStr });
-  } catch (_) {}
+  } catch (_) {
+    if (logBox) logBox.textContent += `[${ts}] [ERROR] 無法寫入本機日誌檔，請檢查應用程式資料目錄權限。\n`;
+  }
 }
 
 const clearLogBtn = document.getElementById('clear-log');
@@ -301,11 +303,13 @@ document.getElementById('stop-confirm').addEventListener('click', async () => {
     let switchMessage = '';
     try {
       const customPath = document.getElementById('codex-path-input').value.trim() || null;
+      await appendLog('INFO', '閘道已停止，開始切換 Codex 原生設定', { configPath: customPath || '預設路徑' });
       const changed = await window.__TAURI__.core.invoke('codex_suspend', { customPath });
-      switchMessage = changed ? '；已切回原生供應商與預設模型清單' : '；未發現由 ModelBridge 管理的設定';
+      switchMessage = changed ? '；已還原停用前的供應商與模型設定' : '；未發現由 ModelBridge 管理的設定';
+      await appendLog(changed ? 'SUCCESS' : 'INFO', changed ? 'Codex 原生設定切換完成' : 'Codex 設定未受 ModelBridge 管理', { configPath: customPath || '預設路徑' });
     } catch (error) {
       switchMessage = `；無法自動切回原生設定：${error}`;
-      appendLog('ERROR', '閘道已停止，但設定切換失敗', error);
+      await appendLog('ERROR', '閘道已停止，但 Codex 原生設定切換失敗', { error: String(error), configPath: document.getElementById('codex-path-input').value.trim() || '預設路徑' });
     }
     status.textContent = `閘道已停止 (本機登入憑證已安全保留)${switchMessage}`;
     appendLog('SUCCESS', '閘道已成功停止，本地登入憑證完整保留在 runtime/auth/');

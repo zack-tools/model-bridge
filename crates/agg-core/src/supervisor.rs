@@ -25,6 +25,8 @@ pub struct StartRequest {
 
 pub struct Supervisor {
     child: Option<Child>,
+    #[cfg(unix)]
+    attached: Option<(u32, String)>,
     #[cfg(windows)]
     adopted: Option<Box<dyn AdoptedProcess>>,
     lock: Option<File>,
@@ -239,6 +241,8 @@ impl Supervisor {
         })?;
         let mut supervisor = Self {
             child: Some(child),
+            #[cfg(unix)]
+            attached: None,
             #[cfg(windows)]
             adopted: None,
             lock: Some(lock),
@@ -262,12 +266,35 @@ impl Supervisor {
         if let Some(child) = self.child.as_ref() { return Some(child.id()); }
         #[cfg(windows)]
         if let Some(process) = self.adopted.as_ref() { return Some(process.pid()); }
+        #[cfg(unix)]
+        if let Some((pid, _)) = &self.attached { return Some(*pid); }
         None
+    }
+
+    #[cfg(unix)]
+    pub fn attach(program: &Path, work_dir: &Path, pid: u32, gateway_key: String, management_key: String) -> Result<Self, String> {
+        let config_path = work_dir.join("config.yaml");
+        let config = crate::corecfg::parse_managed_config(&fs::read_to_string(&config_path).map_err(|e| e.to_string())?)?;
+        if config.host != "127.0.0.1" || config.allow_remote || config.gateway_key != gateway_key || Path::new(&config.auth_dir) != work_dir.join("auth") { return Err("managed configuration does not match stored keys".into()); }
+        let program = fs::canonicalize(program).map_err(|e| e.to_string())?;
+        let command = format!("{} -config {} -local-model", program.display(), config_path.display());
+        if !process_matches(pid, &command)? { return Err("previous process identity does not match".into()); }
+        let lock = lock_exclusive(&work_dir.join("instance.lock"))?;
+        let redactor = Redactor::new([gateway_key.clone(), management_key.clone()]);
+        let management_bearer = format!("Bearer {management_key}");
+        let management = crate::http::exchange(config.port, "GET", "/v8/management/credentials", &[("Authorization", &management_bearer)], Duration::from_secs(5), &redactor)?;
+        if management.status != 200 { return Err("previous gateway management authentication failed".into()); }
+        let bearer = format!("Bearer {gateway_key}");
+        let response = crate::http::exchange(config.port, "GET", "/v1/models", &[("Authorization", &bearer)], Duration::from_secs(2), &redactor)?;
+        if response.status != 200 { return Err("previous gateway did not authenticate".into()); }
+        Ok(Self { child: None, attached: Some((pid, command)), lock: Some(lock), port: config.port, config_path, auth_dir: work_dir.join("auth"), stderr_path: work_dir.join("stderr.log"), stdout_path: work_dir.join("stdout.log"), redactor })
     }
 
     /// Leave the child running when the owning application exits.
     pub fn detach(&mut self) {
         self.child.take();
+        #[cfg(unix)]
+        self.attached.take();
         #[cfg(windows)]
         self.adopted.take();
         self.lock.take();
@@ -278,6 +305,19 @@ impl Supervisor {
     }
 
     pub fn stop_checked(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some((pid, command)) = self.attached.as_ref() {
+            if process_matches(*pid, command)? {
+                let status = Command::new("/bin/kill").args(["-TERM", &pid.to_string()]).status().map_err(|e| e.to_string())?;
+                if !status.success() { return Err("failed to stop attached process".into()); }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while process_matches(*pid, command)? {
+                    if Instant::now() >= deadline { return Err("attached process did not stop".into()); }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            self.attached.take();
+        }
         #[cfg(windows)]
         if let Some(process) = self.adopted.as_ref() {
             process.stop()?;
@@ -309,6 +349,10 @@ impl Supervisor {
         if let Some(child) = self.child.as_mut() {
             if child.try_wait().map_err(|e| format!("process status: {e}"))?.is_some() { return Ok(ProcessHealth::Exited); }
         } else {
+            #[cfg(unix)]
+            if let Some((pid, command)) = &self.attached {
+                return if process_matches(*pid, command)? { self.check_health() } else { Ok(ProcessHealth::Exited) };
+            }
             #[cfg(windows)]
             if self.adopted.as_ref().map(|p| p.alive()).transpose()?.unwrap_or(false) {
                 return self.check_health();
@@ -352,6 +396,17 @@ impl Supervisor {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn process_matches(pid: u32, expected: &str) -> Result<bool, String> {
+    if pid == 0 { return Err("invalid process id".into()); }
+    let output = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "command="]).output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() { return Ok(false); }
+        return Err(format!("process status query failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == expected)
 }
 
 impl Drop for Supervisor {

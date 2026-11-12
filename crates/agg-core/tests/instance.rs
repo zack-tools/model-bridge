@@ -130,3 +130,19 @@ fn desktop_guard_accepts_only_the_expected_runtime() {
     assert!(instance::desktop_guard_runtime(&guard, &dir.join("other")).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn keys_remain_stable_and_invalid_file_is_not_rotated() {
+    let dir = std::env::temp_dir().join(format!("agg-keys-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    let first = instance::ensure_local_keys(&dir).unwrap();
+    assert_eq!(instance::ensure_local_keys(&dir).unwrap(), first);
+    let path = dir.join("local_keys.json");
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    std::fs::write(&path, "invalid").unwrap();
+    assert!(instance::ensure_local_keys(&dir).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "invalid");
+    std::fs::remove_dir_all(dir).unwrap();
+}

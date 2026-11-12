@@ -123,7 +123,7 @@ pub struct CatalogSyncSummary {
 
 fn is_model_bridge_model(entry: &serde_json::Value) -> bool {
     let desc = entry.get("description").and_then(|s| s.as_str()).unwrap_or("");
-    desc.starts_with("model-bridge aggregated model:")
+    desc.starts_with("model-bridge aggregated model:") || desc.starts_with("APP-AGG-001 aggregated model:")
 }
 
 /// Remove models added by ModelBridge while preserving other catalog entries.
@@ -204,6 +204,9 @@ pub fn format_model_display_name(model: &str) -> String {
             })
             .collect::<Vec<_>>()
             .join("-")
+            .split_once('-')
+            .map(|(prefix, rest)| format!("{prefix}-{}", rest.replace('-', " ")))
+            .unwrap_or_else(|| base_model.to_string())
     } else if base_model.starts_with("claude") {
         base_model
             .replace('-', " ")
@@ -256,9 +259,10 @@ pub fn sync_model_catalog(
 
     let (mut root, backup_path) = if existed {
         let text = fs::read_to_string(catalog_path).map_err(|e| CodexError::Message(e.to_string()))?;
-        let backup_name = format!("{}.model-bridge.bak", file_name(catalog_path)?);
-        let bpath = parent.join(&backup_name);
-        fs::copy(catalog_path, &bpath).map_err(|e| CodexError::Message(e.to_string()))?;
+        let bpath = (1u64..).map(|n| parent.join(format!("{}.{n}.app-agg-001.bak", file_name(catalog_path).unwrap_or_default())))
+            .find(|path| !path.exists()).ok_or_else(|| CodexError::Message("無法建立模型目錄備份".into()))?;
+        let mut backup = OpenOptions::new().write(true).create_new(true).open(&bpath).map_err(|e| CodexError::Message(e.to_string()))?;
+        backup.write_all(text.as_bytes()).and_then(|_| backup.sync_all()).map_err(|e| CodexError::Message(e.to_string()))?;
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| CodexError::Message(format!("json parse: {e}")))?;
         (json, Some(bpath))
     } else {
@@ -680,6 +684,49 @@ struct Ownership {
     /// Hash of the managed keys only. Unowned tables such as `[projects.*]` are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256_managed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_fields: Option<NativeFields>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NativeFields { model_provider: Option<String>, model_catalog_json: Option<String>, model: Option<String> }
+fn native_fields(doc: &DocumentMut) -> NativeFields {
+    let field = |key| doc.get(key).and_then(Item::as_str).map(str::to_string);
+    NativeFields { model_provider: field("model_provider"), model_catalog_json: field("model_catalog_json"), model: field("model") }
+}
+fn set_native_fields(doc: &mut DocumentMut, fields: &NativeFields) {
+    for (key, value) in [("model_provider", &fields.model_provider), ("model_catalog_json", &fields.model_catalog_json), ("model", &fields.model)] {
+        if let Some(value) = value { doc[key] = toml_edit::value(value.as_str()); } else { doc.remove(key); }
+    }
+}
+
+fn legacy_native_fields(path: &Path, active: &str) -> Result<Option<NativeFields>, CodexError> {
+    let legacy_path = path.with_file_name(format!("{}.app-agg-001.ownership.json", file_name(path)?));
+    reject_symlink(&legacy_path)?;
+    let Some(legacy) = read_ownership(&legacy_path)? else { return Ok(None); };
+    if legacy.tool != "app-agg-001" { return Ok(None); }
+    let Some(backup_name) = legacy.backup.as_deref() else { return Ok(None); };
+    local_backup_name(backup_name)?;
+    let backup_path = path.with_file_name(backup_name);
+    reject_symlink(&backup_path)?;
+    let backup = parse_doc(&read_existing(&backup_path)?)?;
+    let active = parse_doc(active)?;
+    let provider = |doc: &DocumentMut| doc.get("model_providers")
+        .and_then(Item::as_table_like).and_then(|providers| providers.get(PROVIDER_ID))
+        .map(Item::to_string);
+    let active_provider = provider(&active);
+    let base_url = active.get("model_providers").and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(PROVIDER_ID)).and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("base_url")).and_then(Item::as_str);
+    let catalog = active.get("model_catalog_json").and_then(Item::as_str).map(PathBuf::from);
+    if active.get("model_provider").and_then(Item::as_str) != Some(PROVIDER_ID)
+        || backup.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_ID)
+        || active_provider.is_none() || active_provider != provider(&backup)
+        || base_url.map(validate_base_url) != Some(Ok(()))
+        || catalog.as_deref() != Some(path.with_file_name("model_catalog.json").as_path())
+        || active.get("model").and_then(Item::as_str) != backup.get("model").and_then(Item::as_str)
+    { return Ok(None); }
+    Ok(Some(native_fields(&backup)))
 }
 
 fn hash_without_model(text: &str) -> Result<String, CodexError> {
@@ -796,6 +843,10 @@ fn local_backup_name(name: &str) -> Result<(), CodexError> {
 struct SuspendedConfig {
     active: String,
     native_hash: String,
+    #[serde(default)]
+    native: Option<String>,
+    #[serde(default)]
+    pending_active: Option<String>,
 }
 
 fn suspended_path(path: &Path) -> PathBuf {
@@ -812,12 +863,11 @@ pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
             .map_err(|e| CodexError::Message(e.to_string()))?;
         let current = read_existing(path)?;
         if current == record.active {
-            let mut doc = parse_doc(&record.active)?;
-            doc.remove("model_provider");
-            doc.remove("model_catalog_json");
-            doc.remove("model");
-            doc.remove("model_reasoning_effort");
-            let native = doc.to_string();
+            let native = if let Some(native) = &record.native { native.clone() } else {
+                let mut doc = parse_doc(&record.active)?;
+                doc.remove("model_provider"); doc.remove("model_catalog_json"); doc.remove("model"); doc.remove("model_reasoning_effort");
+                doc.to_string()
+            };
             if crate::pin::sha256_bytes(native.as_bytes()) != record.native_hash { return Err(CodexError::ExternalEdit); }
             atomic_write(path, native.as_bytes())?;
         } else if crate::pin::sha256_bytes(current.as_bytes()) != record.native_hash {
@@ -847,20 +897,54 @@ pub fn suspend_config(path: &Path) -> Result<bool, CodexError> {
             if top_level_string(&backup, "model_provider").as_deref() != Some(PROVIDER_ID) { return Err(CodexError::ExternalEdit); }
             hash_without_model(&backup)?
         };
-        if hash_without_model(&active)? != reference { return Err(CodexError::ExternalEdit); }
+        if hash_without_model(&active)? != reference {
+            let name = owner.backup.as_deref().ok_or(CodexError::ExternalEdit)?;
+            local_backup_name(name)?;
+            let backup = read_existing(&path.with_file_name(name))?;
+            let current_doc = parse_doc(&active)?;
+            let backup_doc = parse_doc(&backup)?;
+            let provider = |doc: &DocumentMut| doc.get("model_providers")
+                .and_then(Item::as_table_like).and_then(|p| p.get(PROVIDER_ID))
+                .map(Item::to_string);
+            let current_provider = provider(&current_doc);
+            let backup_provider = provider(&backup_doc);
+            let catalog = current_doc.get("model_catalog_json").and_then(Item::as_str).map(PathBuf::from);
+            let base_url = current_doc.get("model_providers").and_then(Item::as_table_like)
+                .and_then(|p| p.get(PROVIDER_ID)).and_then(Item::as_table_like)
+                .and_then(|p| p.get("base_url")).and_then(Item::as_str);
+            if owner.tool != "app-agg-001" || owner.native_fields.is_some()
+                || top_level_string(&backup, "model_provider").as_deref() == Some(PROVIDER_ID)
+                || current_provider.is_none() || current_provider != backup_provider
+                || base_url.map(validate_base_url) != Some(Ok(()))
+                || catalog.as_deref() != Some(path.with_file_name("model_catalog.json").as_path())
+                || current_doc.get("model").and_then(Item::as_str) != backup_doc.get("model").and_then(Item::as_str)
+            { return Err(CodexError::ExternalEdit); }
+            owner.native_fields = Some(native_fields(&backup_doc));
+        }
         owner.sha256 = crate::pin::sha256_bytes(active.as_bytes());
-        owner.sha256_without_model = Some(reference);
+        owner.sha256_without_model = Some(hash_without_model(&active)?);
         let bytes = serde_json::to_vec_pretty(&owner).map_err(|e| CodexError::Message(e.to_string()))?;
         atomic_write(&ownership_path(path), &bytes)?;
     }
     let mut doc = active.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
     if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER_ID) { return Err(CodexError::ForeignOwner); }
-    doc.remove("model_provider");
-    doc.remove("model_catalog_json");
-    doc.remove("model");
-    doc.remove("model_reasoning_effort");
+    let mut fields = owner.native_fields.clone().unwrap_or(NativeFields { model_provider: None, model_catalog_json: None, model: None });
+    if fields.model_provider.as_deref() == Some(PROVIDER_ID) {
+        if let Some(origin) = owner.origin.as_ref().and_then(|origin| origin.backup.as_deref()) {
+            local_backup_name(origin)?;
+            let origin_path = path.with_file_name(origin);
+            reject_symlink(&origin_path)?;
+            if let Some(recovered) = legacy_native_fields(path, &read_existing(&origin_path)?)? {
+                fields = recovered;
+                owner.native_fields = Some(fields.clone());
+                let bytes = serde_json::to_vec_pretty(&owner).map_err(|e| CodexError::Message(e.to_string()))?;
+                atomic_write(&ownership_path(path), &bytes)?;
+            }
+        }
+    }
+    set_native_fields(&mut doc, &fields);
     let native = doc.to_string();
-    let record = SuspendedConfig { active, native_hash: crate::pin::sha256_bytes(native.as_bytes()) };
+    let record = SuspendedConfig { active, native_hash: crate::pin::sha256_bytes(native.as_bytes()), native: Some(native.clone()), pending_active: None };
     let bytes = serde_json::to_vec(&record).map_err(|e| CodexError::Message(e.to_string()))?;
     atomic_write(&marker, &bytes)?;
     atomic_write(path, native.as_bytes())?;
@@ -879,33 +963,46 @@ pub fn resume_config(path: &Path, port: u16, gateway_key: &str) -> Result<bool, 
     let marker = suspended_path(path);
     reject_symlink(&marker)?;
     if !marker.exists() { return Ok(false); }
-    let record: SuspendedConfig = serde_json::from_slice(&fs::read(&marker).map_err(|e| CodexError::Message(e.to_string()))?)
+    let mut record: SuspendedConfig = serde_json::from_slice(&fs::read(&marker).map_err(|e| CodexError::Message(e.to_string()))?)
         .map_err(|e| CodexError::Message(e.to_string()))?;
     let current = read_existing(path)?;
-    if crate::pin::sha256_bytes(current.as_bytes()) != record.native_hash {
-        let norm_cur = hash_without_model(&current)?;
-        let mut rec_doc = record.active.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
-        rec_doc.remove("model_provider");
-        rec_doc.remove("model_catalog_json");
-        rec_doc.remove("model");
-        rec_doc.remove("model_reasoning_effort");
-        let norm_rec_native = hash_without_model(&rec_doc.to_string())?;
-        if norm_cur != norm_rec_native {
-            return Err(CodexError::ExternalEdit);
-        }
-    }
     let mut owner = read_ownership(&ownership_path(path))?.ok_or(CodexError::NothingToRollBack)?;
-    if crate::pin::sha256_bytes(record.active.as_bytes()) != owner.sha256 { return Err(CodexError::RollbackConflict); }
+    let active_hash = crate::pin::sha256_bytes(record.active.as_bytes());
+    let current_hash = crate::pin::sha256_bytes(current.as_bytes());
     let req = ApplyRequest { config_path: path.to_path_buf(), base_url: format!("http://127.0.0.1:{port}/v1"), gateway_key: gateway_key.into(), model: None, allow_foreign_override: false, model_catalog_json: None };
     validate_request(&req)?;
     let active = mutate(&record.active, &req)?;
+    if current_hash != record.native_hash && current != record.active && current != active && record.pending_active.as_deref() != Some(&current) {
+        let native = record.native.as_deref().ok_or(CodexError::ExternalEdit)?;
+        if hash_without_model(&current)? != hash_without_model(native)? { return Err(CodexError::ExternalEdit); }
+    }
+    if current != record.active && current != active && record.pending_active.as_deref() != Some(&current) && current_hash != record.native_hash {
+        let doc = current.parse::<DocumentMut>().map_err(|e| CodexError::Message(e.to_string()))?;
+        owner.native_fields = Some(native_fields(&doc));
+        record.native = Some(current.clone());
+        record.native_hash = current_hash.clone();
+    } else if let Some(native) = &record.native {
+        let doc = native.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+        owner.native_fields = Some(native_fields(&doc));
+    }
+    if active_hash != owner.sha256 && current_hash != owner.sha256 { return Err(CodexError::RollbackConflict); }
     owner.sha256 = crate::pin::sha256_bytes(active.as_bytes());
     owner.sha256_without_model = Some(hash_without_model(&active)?);
+    record.pending_active = Some(active.clone());
+    let journal = serde_json::to_vec(&record).map_err(|e| CodexError::Message(e.to_string()))?;
+    atomic_write(&marker, &journal)?;
     atomic_write(path, active.as_bytes())?;
     let body = serde_json::to_vec_pretty(&owner).map_err(|e| CodexError::Message(e.to_string()))?;
     atomic_write(&ownership_path(path), &body)?;
     fs::remove_file(marker).map_err(|e| CodexError::Message(e.to_string()))?;
     Ok(true)
+}
+
+/// Refresh an owned endpoint after restart, including a changed listen port.
+pub fn reconcile_config(path: &Path, port: u16, gateway_key: &str) -> Result<bool, CodexError> {
+    if suspended_path(path).exists() { return resume_config(path, port, gateway_key); }
+    if !suspend_config(path)? { return Ok(false); }
+    resume_config(path, port, gateway_key)
 }
 
 pub fn preview_apply(req: &ApplyRequest) -> Result<ApplyPreview, CodexError> {
@@ -948,6 +1045,10 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
         .ok_or(CodexError::ParentMissing)?;
     let ownership_path = ownership_path(&req.config_path);
     let previous = read_ownership(&ownership_path)?;
+    let initial_native = if let Some(previous) = &previous { previous.native_fields.clone() } else {
+        let doc = before.parse::<DocumentMut>().map_err(|e| CodexError::Message(format!("toml parse: {e}")))?;
+        Some(legacy_native_fields(&req.config_path, &before)?.unwrap_or_else(|| native_fields(&doc)))
+    };
     let generation = previous.as_ref().map(|o| o.generation + 1).unwrap_or(1);
     let latest_backup = if existed {
         let name = format!(
@@ -978,6 +1079,7 @@ pub fn apply_config(req: &ApplyRequest) -> Result<(), CodexError> {
         sha256_without_model: Some(hash_without_model(&after)?),
         origin: Some(origin),
         sha256_managed: Some(crate::pin::sha256_bytes(managed_canonical(&after)?.as_bytes())),
+        native_fields: initial_native,
     };
     let body = serde_json::to_vec_pretty(&ownership).map_err(|e| CodexError::Message(e.to_string()))?;
     if let Err(e) = atomic_write(&ownership_path, &body) {
@@ -1633,12 +1735,12 @@ mod tests {
 
     #[test]
     fn format_model_display_name_avoids_all_caps() {
-        assert_eq!(format_model_display_name("gpt-6.1-terra"), "GPT-6.1-Terra");
-        assert_eq!(format_model_display_name("gpt-6-sol"), "GPT-6-Sol");
-        assert_eq!(format_model_display_name("gpt-6.1-sol"), "GPT-6.1-Sol");
-        assert_eq!(format_model_display_name("gpt-6-luna"), "GPT-6-Luna");
-        assert_eq!(format_model_display_name("gpt-5.6-sol"), "GPT-5.6-Sol");
-        assert_eq!(format_model_display_name("gpt-5.4-mini"), "GPT-5.4-Mini");
+        assert_eq!(format_model_display_name("gpt-6.1-terra"), "GPT-6.1 Terra");
+        assert_eq!(format_model_display_name("gpt-6-sol"), "GPT-6 Sol");
+        assert_eq!(format_model_display_name("gpt-6.1-sol"), "GPT-6.1 Sol");
+        assert_eq!(format_model_display_name("gpt-6-luna"), "GPT-6 Luna");
+        assert_eq!(format_model_display_name("gpt-5.6-sol"), "GPT-5.6 Sol");
+        assert_eq!(format_model_display_name("gpt-5.4-mini"), "GPT-5.4 Mini");
         assert_eq!(format_model_display_name("gemini-3.8-flash-high"), "Gemini 3.8 Flash");
         assert_eq!(format_model_display_name("gemini-3-flash"), "Gemini 3 Flash");
         assert_eq!(format_model_display_name("gemini-3.1-flash-lite"), "Gemini 3.1 Flash Lite");
@@ -1726,8 +1828,11 @@ mod tests {
         assert_eq!(summary.total_models, 3);
         assert_eq!(summary.existing_slugs, vec!["custom-existing-1"]);
         assert_eq!(summary.added_slugs, vec!["gpt-6-astra", "gemini-3.8-flash-high"]);
-        assert!(summary.backup_path.is_some());
-        assert!(summary.backup_path.unwrap().exists());
+        let first_backup = summary.backup_path.unwrap();
+        assert_eq!(fs::read_to_string(&first_backup).unwrap(), serde_json::to_string_pretty(&initial).unwrap());
+        let second_backup = sync_model_catalog(&cat_path, &models).unwrap().backup_path.unwrap();
+        assert_ne!(first_backup, second_backup);
+        assert_eq!(fs::read_to_string(&first_backup).unwrap(), serde_json::to_string_pretty(&initial).unwrap());
 
         let content = fs::read_to_string(&cat_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1816,7 +1921,7 @@ mod tests {
         let doc = native.parse::<DocumentMut>().unwrap();
         assert!(doc.get("model_provider").is_none());
         assert!(doc.get("model_catalog_json").is_none());
-        assert!(doc.get("model").is_none());
+        assert_eq!(doc["model"].as_str(), Some("native-model"));
         assert_eq!(doc["other"].as_bool(), Some(true));
         fs::write(&path, format!("{native}\n# external change\n")).unwrap();
         assert_eq!(resume_config(&path, 50834, "localgateway012345").unwrap_err(), CodexError::ExternalEdit);
@@ -1827,6 +1932,52 @@ mod tests {
         assert_eq!(doc["model"].as_str(), Some("user-selected-model"));
         assert_eq!(doc["model_providers"]["custom"]["base_url"].as_str(), Some("http://127.0.0.1:50834/v1"));
         assert!(!resume_config(&path, 50834, "localgateway012345").unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_model_changes_survive_a_gateway_cycle() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        fs::write(&path, "model = \"original\"\nmodel_catalog_json = \"native.json\"\n").unwrap();
+        apply_config(&req(&dir, Some("gateway-model"))).unwrap();
+        suspend_config(&path).unwrap();
+        let mut native = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        assert_eq!(native["model_catalog_json"].as_str(), Some("native.json"));
+        native["model"] = toml_edit::value("new-native");
+        fs::write(&path, native.to_string()).unwrap();
+        resume_config(&path, 50833, "localgateway012345").unwrap();
+        suspend_config(&path).unwrap();
+        let native = fs::read_to_string(&path).unwrap().parse::<DocumentMut>().unwrap();
+        assert_eq!(native["model"].as_str(), Some("new-native"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interrupted_resume_can_retry_with_a_different_port() {
+        let dir = scratch();
+        let request = req(&dir, Some("gateway-model"));
+        fs::write(&request.config_path, "model = \"native\"\n").unwrap();
+        apply_config(&request).unwrap();
+        suspend_config(&request.config_path).unwrap();
+        let marker = suspended_path(&request.config_path);
+        let mut journal: SuspendedConfig = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        let mut native = fs::read_to_string(&request.config_path).unwrap().parse::<DocumentMut>().unwrap();
+        native["model"] = toml_edit::value("new-native");
+        journal.native = Some(native.to_string());
+        journal.native_hash = crate::pin::sha256_bytes(native.to_string().as_bytes());
+        let mut next = request.clone();
+        next.base_url = "http://127.0.0.1:50834/v1".into();
+        next.model = None;
+        let pending = mutate(&journal.active, &next).unwrap();
+        journal.pending_active = Some(pending.clone());
+        fs::write(&marker, serde_json::to_vec(&journal).unwrap()).unwrap();
+        fs::write(&request.config_path, pending).unwrap();
+        resume_config(&request.config_path, 50835, &request.gateway_key).unwrap();
+        let result = fs::read_to_string(&request.config_path).unwrap();
+        assert!(result.contains("127.0.0.1:50835"));
+        suspend_config(&request.config_path).unwrap();
+        assert_eq!(top_level_string(&fs::read_to_string(&request.config_path).unwrap(), "model").as_deref(), Some("new-native"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1874,6 +2025,73 @@ mod tests {
         assert!(suspend_config(&req.config_path).unwrap());
         assert!(resume_config(&req.config_path, 50833, "localgateway012345").unwrap());
         assert_eq!(top_level_string(&fs::read_to_string(&req.config_path).unwrap(), "model").as_deref(), Some("new-model"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_native_backup_preserves_external_edits_on_suspend() {
+        let dir = scratch();
+        let request = req(&dir, Some("native-model"));
+        let path = &request.config_path;
+        let backup = "model = \"native-model\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:18431/v1\"\n";
+        fs::write(path, backup).unwrap();
+        let mut applied = request.clone();
+        applied.model_catalog_json = Some(dir.join("model_catalog.json"));
+        apply_config(&applied).unwrap();
+        let active = fs::read_to_string(path).unwrap();
+        let backup_path = path.with_file_name("legacy-native.bak");
+        let mut backup_doc = parse_doc(&active).unwrap();
+        backup_doc.remove("model_provider");
+        backup_doc.remove("model_catalog_json");
+        fs::write(&backup_path, backup_doc.to_string()).unwrap();
+        let owner_path = ownership_path(path);
+        let mut owner = read_ownership(&owner_path).unwrap().unwrap();
+        owner.tool = "app-agg-001".into();
+        owner.backup = Some("legacy-native.bak".into());
+        owner.native_fields = None;
+        fs::write(&owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+        fs::write(path, active.replace("model = \"native-model\"", "model = \"native-model\"\nexternal_setting = true")).unwrap();
+        assert!(suspend_config(path).unwrap());
+        let native = parse_doc(&fs::read_to_string(path).unwrap()).unwrap();
+        assert!(native.get("model_provider").is_none());
+        assert!(native.get("model_catalog_json").is_none());
+        assert_eq!(native["external_setting"].as_bool(), Some(true));
+        assert_eq!(native["model"].as_str(), Some("native-model"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_gateway_state_is_not_saved_as_native() {
+        let dir = scratch();
+        let mut request = req(&dir, Some("native-model"));
+        request.model_catalog_json = Some(dir.join("model_catalog.json"));
+        request.allow_foreign_override = true;
+        let active = mutate("", &request).unwrap();
+        let mut backup = parse_doc(&active).unwrap();
+        backup.remove("model_provider");
+        backup.remove("model_catalog_json");
+        fs::write(dir.join("legacy.bak"), backup.to_string()).unwrap();
+        fs::write(&request.config_path, &active).unwrap();
+        let legacy = Ownership {
+            tool: "app-agg-001".into(), generation: 1,
+            sha256: crate::pin::sha256_bytes(active.as_bytes()),
+            managed_provider_id: PROVIDER_ID.into(), backup: Some("legacy.bak".into()),
+            created: false, sha256_without_model: None, origin: None,
+            sha256_managed: None, native_fields: None,
+        };
+        let legacy_path = dir.join("config.toml.app-agg-001.ownership.json");
+        fs::write(legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        apply_config(&request).unwrap();
+        let owner_path = ownership_path(&request.config_path);
+        let mut owner = read_ownership(&owner_path).unwrap().unwrap();
+        assert!(owner.native_fields.as_ref().unwrap().model_provider.is_none());
+        owner.native_fields = Some(native_fields(&parse_doc(&active).unwrap()));
+        fs::write(owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+        assert!(suspend_config(&request.config_path).unwrap());
+        let native = parse_doc(&fs::read_to_string(&request.config_path).unwrap()).unwrap();
+        assert!(native.get("model_provider").is_none());
+        assert!(native.get("model_catalog_json").is_none());
+        assert_eq!(native["model"].as_str(), Some("native-model"));
         let _ = fs::remove_dir_all(dir);
     }
 

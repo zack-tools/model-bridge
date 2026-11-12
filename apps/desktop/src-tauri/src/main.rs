@@ -140,12 +140,31 @@ async fn codex_resume(state: State<'_, Shared>, custom_path: Option<String>) -> 
         let snapshot = GatewaySnapshot::read(&state)?;
         let path = codex_config_path(custom_path)?;
         snapshot.check(&state)?;
-        agg_core::codex::resume_config(&path, snapshot.port, &snapshot.gateway_key).map_err(|e| e.to_string())
+        agg_core::codex::reconcile_config(&path, snapshot.port, &snapshot.gateway_key).map_err(|e| e.to_string())
     }).await.map_err(|_| "恢復閘道設定失敗".to_string())?
 }
 
 fn ensure_local_keys(dir: &std::path::Path) -> Result<(String, String), String> {
     agg_core::instance::ensure_local_keys(dir)
+}
+
+#[cfg(unix)]
+fn adopt_previous_gateway(dir: &std::path::Path) -> Result<(Supervisor, std::fs::File, String, String), String> {
+    let runtime = instance::desktop_guard_runtime(&dir.join("gateway.running"), &dir.join("runtime"))?;
+    let lock = instance::acquire(&dir.join("gateway.lock"))?;
+    let (gateway_key, management_key) = instance::read_local_keys(dir)?;
+    let pid: u32 = std::fs::read_to_string(dir.join("gateway.pid")).map_err(|e| e.to_string())?.trim().parse().map_err(|_| "invalid gateway pid")?;
+    let core_dir = std::env::var_os("APP_AGG_CORE_DIR").map(PathBuf::from).ok_or("missing core directory")?;
+    let binary = core_dir.join("cli-proxy-api");
+    let archive = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "CLIProxyAPI_8.0.57_darwin_aarch64.tar.gz",
+        ("macos", "x86_64") => "CLIProxyAPI_8.0.57_darwin_amd64.tar.gz",
+        ("linux", "x86_64") => "CLIProxyAPI_8.0.57_linux_amd64.tar.gz",
+        _ => return Err("unsupported platform".into()),
+    };
+    pin::verify_native_binary(&core_dir.join(archive), &binary)?;
+    let process = Supervisor::attach(&binary, &runtime, pid, gateway_key.clone(), management_key.clone())?;
+    Ok((process, lock, gateway_key, management_key))
 }
 
 #[tauri::command]
@@ -370,7 +389,7 @@ async fn gateway_status(app: tauri::AppHandle, state: State<'_, Shared>) -> Resu
             };
         }
         if guard_path.exists() {
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             if let Ok((mut process, instance_lock, gateway_key, management_key)) = adopt_previous_gateway(&dir) {
                 let mut gateway = state.lock().map_err(|_| "閘道狀態無法讀取")?;
                 if gateway.epoch != epoch || gateway.lifecycle_busy || gateway.process.is_some() {
@@ -1023,11 +1042,12 @@ async fn log_message(app: tauri::AppHandle, level: String, message: String, deta
         } else {
             format!("[{now}] [{level}] {message} - {details}\n")
         };
+        let line = agg_core::redact::redact_text(&line);
         eprint!("{line}");
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {
-            let _ = f.write_all(line.as_bytes());
-        }
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log_file)
+            .map_err(|_| "無法開啟日誌檔".to_string())?;
+        file.write_all(line.as_bytes()).map_err(|_| "無法寫入日誌檔".to_string())?;
         Ok(())
     }).await.map_err(|_| "日誌寫入失敗".to_string())?
 }

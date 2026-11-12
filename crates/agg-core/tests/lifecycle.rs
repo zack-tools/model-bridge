@@ -118,3 +118,47 @@ fn detached_supervisor_leaves_child_running() {
     assert!(alive && killed, "detached child must remain alive until explicitly stopped");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn detached_gateway_can_be_reattached_and_stopped() {
+    let dir = work_dir("reattach");
+    let mut original = start(&dir, "healthy", Duration::from_secs(3)).unwrap();
+    let pid = original.pid().unwrap();
+    let port = original.port;
+    original.detach();
+    drop(original);
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_agg-mock-core"));
+    let mut attached = Supervisor::attach(&binary, &dir, pid, "agglocal0123456789abcdef".into(), "mgmt0123456789abcdef".into()).unwrap();
+    assert_eq!(attached.port, port);
+    assert_eq!(attached.health().unwrap(), ProcessHealth::Healthy);
+    attached.stop_checked().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the pinned native core archive and executable"]
+fn native_core_can_be_reattached_after_it_hashes_management_key() {
+    let archive = PathBuf::from(std::env::var("APP_AGG_CORE_ARCHIVE").expect("archive required"));
+    let binary = PathBuf::from(std::env::var("APP_AGG_CORE_BIN").expect("binary required"));
+    agg_core::pin::verify_native_binary(&archive, &binary).unwrap();
+    let dir = work_dir("native-reattach");
+    let gateway_key = "agglocal0123456789abcdef";
+    let management_key = "mgmt0123456789abcdef";
+    let mut original = Supervisor::start(StartRequest {
+        program: binary.clone(), work_dir: dir.clone(), port: None, extra_env: vec![],
+        health_timeout: Duration::from_secs(45), gateway_key: gateway_key.into(), management_password: management_key.into(),
+    }).unwrap();
+    let pid = original.pid().unwrap();
+    let port = original.port;
+    let config = std::fs::read_to_string(dir.join("config.yaml")).unwrap();
+    assert_ne!(agg_core::corecfg::parse_managed_config(&config).unwrap().management_key, management_key);
+    original.detach();
+    drop(original);
+    let mut attached = Supervisor::attach(&binary, &dir, pid, gateway_key.into(), management_key.into()).unwrap();
+    assert_eq!(attached.port, port);
+    assert_eq!(attached.health().unwrap(), ProcessHealth::Healthy);
+    attached.stop_checked().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

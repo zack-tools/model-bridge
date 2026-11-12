@@ -188,7 +188,12 @@ fn parse_local_keys(content: &str) -> Result<(String, String), String> {
 }
 
 pub fn ensure_local_keys(dir: &Path) -> Result<(String, String), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create key directory: {e}"))?;
     let key_file = dir.join("local_keys.json");
+    if let Ok(metadata) = std::fs::symlink_metadata(&key_file) {
+        if metadata.file_type().is_symlink() { return Err("key file is a symlink".into()); }
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("protect key file: {e}"))?; }
+    }
     match std::fs::read_to_string(&key_file) {
         Ok(content) => return parse_local_keys(&content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
